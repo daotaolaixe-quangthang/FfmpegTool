@@ -56,6 +56,10 @@ def extract_by_scene(video_path: str, raw_dir: str, threshold: float, jpeg_quali
     scenes = scene_manager.get_scene_list()
     print(f"  [SCENE] Found {len(scenes)} scenes")
 
+    if not scenes:
+        print("  [SCENE] No scenes detected -- falling back to 1 fps extraction")
+        return extract_by_fps(video_path, raw_dir, fps=1.0, jpeg_quality=jpeg_quality)
+
     frame_paths = []
     for i, (start, end) in enumerate(scenes):
         # Use the middle of each scene (most stable frame)

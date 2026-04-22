@@ -112,6 +112,11 @@ def process_video(video_path: str, output_dir: str, cfg: dict) -> dict:
     video_name = Path(video_path).stem
     video_output_dir = os.path.join(output_dir, video_name)
     raw_dir = os.path.join(video_output_dir, "_raw")
+    unique_dir = os.path.join(video_output_dir, "unique_frames")
+    top_frames_dir = os.path.join(video_output_dir, "top_frames")
+
+    for transient_dir in (raw_dir, unique_dir, top_frames_dir):
+        shutil.rmtree(transient_dir, ignore_errors=True)
 
     sep = "=" * 58
     print(f"\n{sep}")
@@ -136,9 +141,16 @@ def process_video(video_path: str, output_dir: str, cfg: dict) -> dict:
 
     # ── Step 4 (Optional): Aesthetic scoring ──
     scorer_cfg = cfg["scorer"]
-    if scorer_cfg.get("enabled") and stats["final_paths"]:
+    stats["scorer_enabled"] = bool(scorer_cfg.get("enabled"))
+    stats["top_n_requested"] = scorer_cfg.get("top_n") if stats["scorer_enabled"] else None
+    stats["top_n_selected"] = 0 if stats["scorer_enabled"] else None
+    stats["top_frames_dir"] = None
+    stats["score_report_path"] = None
+
+    if stats["scorer_enabled"] and stats["final_paths"]:
         top_n = scorer_cfg.get("top_n", 30)
         top_n = min(top_n, len(stats["final_paths"]))  # can't select more than available
+        stats["top_n_requested"] = scorer_cfg.get("top_n", 30)
 
         scored = score_all_frames(stats["final_paths"])
         print_top_scores(scored, n=min(10, top_n))
@@ -149,6 +161,7 @@ def process_video(video_path: str, output_dir: str, cfg: dict) -> dict:
 
         if scorer_cfg.get("save_score_report"):
             rp = save_score_report(scored, video_output_dir)
+            stats["score_report_path"] = rp
             print(f"[SCORE] Score report saved: {rp}")
 
     # ── Step 5: Cleanup raw ──
@@ -192,7 +205,7 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
 
     # Per-video result tracking
     video_results: list[dict] = []
-    success, failed_count = 0, 0
+    success_count, skipped_count, error_count = 0, 0, 0
 
     for i, video_path in enumerate(video_files, 1):
         fname = os.path.basename(video_path)
@@ -200,7 +213,7 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
         try:
             stats = process_video(video_path, output_dir, cfg)
             if stats:  # process_video returns {} on 0 frames
-                success += 1
+                success_count += 1
                 video_results.append({
                     "index":               i,
                     "video_name":          fname,
@@ -214,7 +227,7 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
                     "error":               None,
                 })
             else:
-                failed_count += 1
+                skipped_count += 1
                 video_results.append({
                     "index":               i,
                     "video_name":          fname,
@@ -228,7 +241,7 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
                     "error":               "No frames extracted (video may be too short or unreadable)",
                 })
         except Exception as e:
-            failed_count += 1
+            error_count += 1
             error_msg = str(e)
             print(f"[ERROR] Failed on {fname}: {error_msg}")
             video_results.append({
@@ -244,17 +257,19 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
                 "error":               error_msg,
             })
 
-    print(f"\n[BATCH] Done. Success: {success} | Failed: {failed_count}")
-    failed_names = [v["video_name"] for v in video_results if v["status"] != "success"]
-    if failed_names:
-        print(f"[BATCH] Failed files: {', '.join(failed_names)}")
+    print(f"\n[BATCH] Done. Success: {success_count} | Skipped: {skipped_count} | Errors: {error_count}")
+    non_success_names = [v["video_name"] for v in video_results if v["status"] != "success"]
+    if non_success_names:
+        print(f"[BATCH] Non-success files: {', '.join(non_success_names)}")
 
     # ── Save _batch_summary.json for app.py to read ──
     os.makedirs(output_dir, exist_ok=True)
     summary = {
         "total_videos":      total,
-        "success":           success,
-        "failed":            failed_count,
+        "success":           success_count,
+        "skipped":           skipped_count,
+        "error":             error_count,
+        "failed":            skipped_count + error_count,
         "input_folder":      input_folder,
         "output_folder":     output_dir,
         "generated_at":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -267,7 +282,7 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
     print(f"[BATCH_SUMMARY] {summary_path}")
 
     # ── Generate consolidated master HTML for all processed videos ──
-    if success > 0:
+    if success_count > 0:
         html_path = save_batch_html_preview(output_dir)
         if html_path:
             print(f"[BATCH] Master preview: {html_path}")
@@ -308,7 +323,7 @@ Examples:
     )
 
     # ── Input source ──
-    src = parser.add_mutually_exclusive_group(required=True)
+    src = parser.add_mutually_exclusive_group()
     src.add_argument("--input", "-i",
                      help="Path to a local video file")
     src.add_argument("--url", "-u",
@@ -317,7 +332,7 @@ Examples:
                      help="Folder of videos to process in batch")
 
     # ── Output ──
-    parser.add_argument("--output", "-o", required=True,
+    parser.add_argument("--output", "-o",
                         help="Output root folder")
 
     # ── Extraction ──
@@ -391,6 +406,13 @@ def main():
     cfg = apply_defaults(load_config("config.json"))
     cfg = apply_cli_overrides(cfg, args)
 
+    input_sources = [args.input, args.url, args.batch]
+    input_source_count = sum(1 for value in input_sources if value)
+    is_standalone_utility = args.gen_batch_html or args.clean_empty
+
+    if is_standalone_utility and input_source_count > 0:
+        parser.error("--gen-batch-html and --clean-empty cannot be combined with --input, --url, or --batch")
+
     # ── Standalone utility: regenerate master HTML from existing output folder ──
     if args.gen_batch_html:
         if not args.output or not os.path.isdir(args.output):
@@ -419,6 +441,11 @@ def main():
                 removed_count += 1
         print(f"[CLEAN] Done — removed {removed_count} empty folder(s).")
         sys.exit(0)
+
+    if input_source_count != 1:
+        parser.error("one of the arguments --input/-i --url/-u --batch/-b is required")
+    if not args.output:
+        parser.error("the following arguments are required: --output/-o")
 
     # Print active config summary
     sep = "=" * 58

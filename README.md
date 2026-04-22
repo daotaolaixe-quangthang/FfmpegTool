@@ -83,7 +83,7 @@ Browser tự mở `http://localhost:5000`
 | Cài đặt | Mô tả |
 |---|---|
 | **Mode: FPS** | Lấy N frame mỗi giây. Mặc định 5fps → 1 frame/0.2 giây |
-| **Mode: Scene** | Phát hiện cảnh cắt → lấy 1 frame giữa mỗi cảnh (thông minh hơn) |
+| **Mode: Scene** | Phát hiện cảnh cắt → lấy 1 frame giữa mỗi cảnh; nếu không detect được scene nào, tool tự fallback sang extract 1 fps để không bỏ trắng video |
 | **Frames Per Second** | Slider 1–30. Thấp = ít frame hơn, nhanh hơn. Cao = nhiều frame, chậm hơn |
 
 > **Khuyến nghị:** Video TikTok ngắn dùng `fps=5`. Video dài nhiều cảnh cắt dùng `Scene`.
@@ -113,7 +113,7 @@ Browser tự mở `http://localhost:5000`
 | Cài đặt | Mô tả |
 |---|---|
 | **Enable Scorer** | Bật/tắt tính năng chấm điểm |
-| **Top N Frames** | Số frame tốt nhất cần chọn (copy vào thư mục `top_frames/`) |
+| **Top N Frames** | Số frame tốt nhất cần chọn (copy vào thư mục `top_frames/`; UI cũng hiển thị trạng thái scorer, số frame đã chọn và việc có lưu score report hay không) |
 
 **Scorer chấm điểm theo 5 tiêu chí:**
 
@@ -151,6 +151,8 @@ Kết quả hiện ngay dưới terminal:
 - `📁 Open Output Folder` — Mở thư mục kết quả trong Explorer
 - `🖼 View HTML Preview` — Mở gallery hình ảnh trong browser
 - `↺ Run Again` — Chạy lại với cài đặt khác
+
+> Khi bật **Scorer**, UI vẫn giữ flow preview/open-folder hiện tại cho `unique_frames/`, đồng thời hiển thị thêm trạng thái scorer, số frame được chọn vào `top_frames/`, và việc có lưu `score_report.json` hay không.
 
 ---
 
@@ -364,7 +366,7 @@ Sau mỗi lần chạy batch (nhiều video), tool tự động tạo file **`_b
 Xóa các sub-folder trong output không có `unique_frames/` (thường xảy ra khi video không extract được frame nào).
 
 ```bat
-python main.py --input dummy --output "G:\...\story1-frame" --clean-empty
+python main.py --output "G:\...\story1-frame" --clean-empty
 ```
 
 Ví dụ output:
@@ -378,7 +380,7 @@ Ví dụ output:
 Tạo (hoặc tạo lại) file `_batch_preview.html` từ output folder có sẵn mà **không cần chạy lại pipeline**. Hữu ích khi bạn đã xử lý xong và muốn regenerate gallery.
 
 ```bat
-python main.py --input dummy --output "G:\...\story1-frame" --gen-batch-html
+python main.py --output "G:\...\story1-frame" --gen-batch-html
 ```
 
 Ví dụ output:
@@ -387,7 +389,7 @@ Ví dụ output:
 [OK] Master batch HTML generated: G:\...\story1-frame\_batch_preview.html
 ```
 
-> **Lưu ý:** Cả hai flags `--clean-empty` và `--gen-batch-html` là **standalone** — chạy xong tự thoát, không cần truyền input video thật cho `--input`.
+> **Lưu ý:** Cả hai flags `--clean-empty` và `--gen-batch-html` là **standalone** — chạy xong tự thoát, không cần truyền `--input`, `--url` hay `--batch`.
 
 ---
 

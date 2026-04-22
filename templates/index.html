@@ -889,6 +889,8 @@
           </div>
         </div>
 
+        <div id="scorer-summary" class="batch-badge" style="display:none;margin-top:0;margin-bottom:14px"></div>
+
         <div class="action-row" id="result-actions">
           <button class="btn btn-primary" id="btn-open-folder" onclick="openFolder()">
             📁 Open Output Folder
@@ -1148,6 +1150,15 @@
   // ═══════════════════════════════════════
   // RESULTS PANEL
   // ═══════════════════════════════════════
+  function escapeHtml(value) {
+    return String(value)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }
+
   function showResults(stats) {
     document.getElementById('results-panel').style.display = 'block';
 
@@ -1160,7 +1171,9 @@
     const blur      = stats.removed_blurry     ?? '—';
     const dup       = stats.removed_duplicate  ?? '—';
     const unique    = stats.final_unique_frames ?? '—';
-    const topN      = stats.top_n_selected;
+    const scorerEnabled = !!stats.scorer_enabled;
+    const topNRequested = stats.top_n_requested;
+    const topNSelected  = stats.top_n_selected;
     const reduction = stats.reduction_rate     ?? '—';
 
     // Inject batch badge above stats grid
@@ -1181,12 +1194,23 @@
     document.getElementById('s-unique').textContent = unique;
 
     const row2 = document.getElementById('s-row2');
-    if (topN) {
+    const scorerSummary = document.getElementById('scorer-summary');
+    if (scorerEnabled) {
       row2.style.display = 'grid';
-      document.getElementById('s-top').textContent       = topN;
+      document.getElementById('s-top').textContent       = topNSelected ?? 0;
       document.getElementById('s-reduction').textContent = reduction;
+
+      const requestedText = topNRequested ?? '—';
+      const selectedText = topNSelected ?? 0;
+      const extras = [];
+      if (stats.top_frames_dir) extras.push('top_frames ready');
+      if (stats.score_report_path) extras.push('score report saved');
+      scorerSummary.textContent = `⭐ Scorer enabled — requested ${requestedText}, selected ${selectedText}${extras.length ? ` · ${extras.join(' · ')}` : ''}`;
+      scorerSummary.style.display = 'inline-flex';
     } else {
       row2.style.display = 'none';
+      scorerSummary.style.display = 'none';
+      scorerSummary.textContent = '';
     }
 
     // Batch per-video table
@@ -1200,7 +1224,8 @@
 
       const total   = stats.total_videos    ?? stats.video_results.length;
       const success = stats.videos_processed ?? stats.video_results.filter(v => v.status === 'success').length;
-      const failed  = stats.videos_failed   ?? stats.video_results.filter(v => v.status !== 'success').length;
+      const skipped = stats.videos_skipped   ?? stats.video_results.filter(v => v.status === 'skipped').length;
+      const failed  = stats.videos_failed    ?? stats.video_results.filter(v => v.status === 'error').length;
 
       // Summary chips
       summaryBar.innerHTML = `
@@ -1210,7 +1235,8 @@
         <div class="bsb-chip ok">
           <span class="bsb-num">${success}</span> ✓ Done
         </div>
-        ${failed > 0 ? `<div class="bsb-chip fail"><span class="bsb-num">${failed}</span> ✕ Failed</div>` : ''}
+        ${skipped > 0 ? `<div class="bsb-chip total"><span class="bsb-num">${skipped}</span> ⚠ Skipped</div>` : ''}
+        ${failed > 0 ? `<div class="bsb-chip fail"><span class="bsb-num">${failed}</span> ✕ Error</div>` : ''}
       `;
 
       stats.video_results.forEach((v, idx) => {
@@ -1229,21 +1255,24 @@
         }
 
         // Error reason (shown below badge for failed/skipped)
+        const safeError = escapeHtml(v.error ?? '');
         const errorHtml = (!isOk && v.error)
-          ? `<div class="error-reason" title="${v.error.replace(/"/g,'&quot;')}">${v.error}</div>`
+          ? `<div class="error-reason" title="${safeError}">${safeError}</div>`
           : '';
 
         const numCls = isOk ? '' : ' td-dim';
+        const safeVideoName = escapeHtml(v.video_name ?? '');
+        const safeIndex = escapeHtml(v.index ?? (idx + 1));
 
         const tr = document.createElement('tr');
         tr.innerHTML = `
-          <td style="color:var(--text-muted)">${v.index ?? (idx + 1)}</td>
-          <td title="${v.video_name}">${v.video_name}</td>
+          <td style="color:var(--text-muted)">${safeIndex}</td>
+          <td title="${safeVideoName}">${safeVideoName}</td>
           <td>${badgeHtml}${errorHtml}</td>
-          <td class="${isOk ? '' : 'td-dim'}">${isOk ? v.total_raw_frames : '—'}</td>
-          <td class="td-red${numCls}">${isOk ? v.removed_blurry : '—'}</td>
-          <td class="td-red${numCls}">${isOk ? v.removed_duplicate : '—'}</td>
-          <td class="td-green${numCls}">${isOk ? v.final_unique_frames : '—'}</td>
+          <td class="${isOk ? '' : 'td-dim'}">${isOk ? escapeHtml(v.total_raw_frames) : '—'}</td>
+          <td class="td-red${numCls}">${isOk ? escapeHtml(v.removed_blurry) : '—'}</td>
+          <td class="td-red${numCls}">${isOk ? escapeHtml(v.removed_duplicate) : '—'}</td>
+          <td class="td-green${numCls}">${isOk ? escapeHtml(v.final_unique_frames) : '—'}</td>
         `;
         tbody.appendChild(tr);
       });
@@ -1261,14 +1290,9 @@
   async function openFolder() {
     if (!currentStats) return;
 
-    let folder;
-    if (currentStats.is_batch) {
-      // For batch: open the root output folder
-      folder = currentStats.output_folder || '';
-    } else {
-      // For single video: go up from unique_frames/ to the video folder
-      folder = (currentStats.output_folder || '').replace(/[\\\/]unique_frames[\\\/]?$/, '');
-    }
+    const folder = currentStats.is_batch
+      ? (currentStats.output_folder || '')
+      : (currentStats.output_folder ? currentStats.output_folder.replace(/[\\\/]?unique_frames$/, '').replace(/[\\\/]+$/, '') : '');
 
     await fetch('/api/open-folder', {
       method: 'POST',

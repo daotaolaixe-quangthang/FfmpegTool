@@ -10,6 +10,7 @@ Generate two types of output after filtering:
 import os
 import json
 import base64
+from html import escape
 from datetime import datetime
 from pathlib import Path
 
@@ -24,7 +25,11 @@ def save_json_report(stats: dict, output_dir: str, video_name: str) -> str:
         "removed_duplicate" : stats["removed_duplicate"],
         "final_unique_frames": stats["final_count"],
         "reduction_rate"    : f"{(1 - stats['final_count'] / max(stats['total_raw'], 1)) * 100:.1f}%",
+        "scorer_enabled"    : stats.get("scorer_enabled", False),
+        "top_n_requested"   : stats.get("top_n_requested"),
         "top_n_selected"    : stats.get("top_n_selected"),   # None if scorer disabled
+        "top_frames_dir"    : stats.get("top_frames_dir"),
+        "score_report_path" : stats.get("score_report_path"),
         "output_folder"     : stats["output_dir"],
         "blur_threshold_used"       : stats.get("blur_threshold"),
         "similarity_threshold_used" : stats.get("similarity_threshold"),
@@ -51,6 +56,8 @@ def save_html_preview(final_paths: list[str], output_dir: str,
             data = base64.b64encode(f.read()).decode()
         return f"data:image/jpeg;base64,{data}"
 
+    safe_video_name = escape(video_name)
+
     # Build image grid HTML — limit to 150 frames to keep file size manageable
     # (base64 encoding: ~100KB/frame × 200 frames = 20MB HTML = slow browser)
     MAX_PREVIEW = 150
@@ -67,11 +74,12 @@ def save_html_preview(final_paths: list[str], output_dir: str,
     cards_html = ""
     for i, path in enumerate(preview_paths):
         fname = os.path.basename(path)
+        safe_fname = escape(fname)
         data_uri = img_to_data_uri(path)
         cards_html += f"""
         <div class="card">
-          <img src="{data_uri}" alt="{fname}" loading="lazy">
-          <div class="label">{i+1:03d} — {fname}</div>
+          <img src="{data_uri}" alt="{safe_fname}" loading="lazy">
+          <div class="label">{i+1:03d} — {safe_fname}</div>
         </div>"""
 
     reduction = (1 - stats['final_count'] / max(stats['total_raw'], 1)) * 100
@@ -81,7 +89,7 @@ def save_html_preview(final_paths: list[str], output_dir: str,
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Frame Preview — {video_name}</title>
+  <title>Frame Preview — {safe_video_name}</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
@@ -170,7 +178,7 @@ def save_html_preview(final_paths: list[str], output_dir: str,
 </head>
 <body>
   <header>
-    <h1>Frame Preview — {video_name}</h1>
+    <h1>Frame Preview — {safe_video_name}</h1>
     <div class="stats">
       <div class="stat">
         <span class="num">{stats['total_raw']}</span>
@@ -245,23 +253,28 @@ def save_batch_html_preview(batch_output_dir: str) -> str:
     if not sections:
         return None
 
+    safe_batch_name = escape(batch_dir.name)
+
     # Build per-video section HTML
     sections_html = ""
     for sec in sections:
+        safe_section_name = escape(sec["name"])
         cards = ""
         for i, rel_path in enumerate(sec["frames"]):
             fname = Path(rel_path).name
+            safe_fname = escape(fname)
+            safe_rel_attr = escape(rel_path, quote=True)
             cards += f"""
-        <div class="card" onclick="openModal('{rel_path}')">
-          <img src="{rel_path}" alt="{fname}" loading="lazy">
-          <div class="label">{i+1:03d} — {fname}</div>
+        <div class="card" data-src="{safe_rel_attr}" onclick="openModal(this.dataset.src)">
+          <img src="{safe_rel_attr}" alt="{safe_fname}" loading="lazy">
+          <div class="label">{i+1:03d} — {safe_fname}</div>
         </div>"""
 
         sections_html += f"""
   <section class="video-section">
     <div class="section-header" onclick="toggleSection(this)">
       <span class="toggle-icon">▾</span>
-      <h2>{sec['name']}</h2>
+      <h2>{safe_section_name}</h2>
       <span class="badge">{len(sec['frames'])} frames</span>
     </div>
     <div class="frames-grid">
@@ -274,7 +287,7 @@ def save_batch_html_preview(batch_output_dir: str) -> str:
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Batch Preview — {batch_dir.name}</title>
+  <title>Batch Preview — {safe_batch_name}</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
@@ -458,7 +471,7 @@ def save_batch_html_preview(batch_output_dir: str) -> str:
 
   <div class="topbar">
     <div>
-      <h1>📁 Batch Preview — {batch_dir.name}</h1>
+      <h1>📁 Batch Preview — {safe_batch_name}</h1>
       <div class="subtitle">All extracted frames across all videos · click any frame to enlarge</div>
     </div>
     <div class="pills">

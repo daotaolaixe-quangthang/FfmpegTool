@@ -1,0 +1,54 @@
+# Python cache / compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE / local tool settings
+.vscode/
+.idea/
+.claude/settings.local.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local logs / temp files
+*.log
+*.tmp
+*.temp
+
+# FfmpegTool generated outputs
+_raw/
+unique_frames/
+top_frames/
+preview.html
+_batch_preview.html
+_batch_summary.json
+report.json
+score_report.json
+
+# Common local output/download folders
+output/
+outputs/
+downloads/

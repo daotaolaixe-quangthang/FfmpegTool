@@ -78,8 +78,8 @@ def filter_blurry(frame_paths: list[str], blur_threshold: float) -> tuple[list[s
 
 def compute_phash(image_path: str, hash_size: int = 16) -> imagehash.ImageHash:
     """Compute perceptual hash of an image."""
-    img = Image.open(image_path)
-    return imagehash.phash(img, hash_size=hash_size)
+    with Image.open(image_path) as img:
+        return imagehash.phash(img, hash_size=hash_size)
 
 
 def hamming_to_similarity(distance: int, max_distance: int = None) -> float:

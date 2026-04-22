@@ -17,11 +17,12 @@ import re
 import sys
 import uuid
 import json
+import html
 import queue
 import threading
 import subprocess
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify, Response, send_from_directory
 
 # ── Ensure FfmpegTool dir is in path ──
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -84,6 +85,50 @@ def load_result_stats(output_dir: str, video_name: str) -> dict | None:
     return None
 
 
+def resolve_single_video_dir(stats: dict) -> Path | None:
+    """Resolve the per-video output folder from stats written by the CLI pipeline."""
+    output_folder = stats.get("output_folder")
+    if not output_folder:
+        return None
+
+    output_path = Path(os.path.normpath(output_folder))
+    if output_path.name == "unique_frames":
+        return output_path.parent
+    return output_path
+
+
+def resolve_preview_path(stats: dict) -> str:
+    """Resolve the preview HTML path for either batch or single-video jobs."""
+    if stats.get("is_batch"):
+        preview_path = stats.get("batch_preview_path", "")
+        return os.path.normpath(preview_path) if preview_path else ""
+
+    video_dir = resolve_single_video_dir(stats)
+    if not video_dir:
+        return ""
+    return os.path.normpath(str(video_dir / "preview.html"))
+
+
+def resolve_open_folder(stats: dict) -> str:
+    """Resolve the folder that should open in Explorer for the current job."""
+    if stats.get("is_batch"):
+        folder = stats.get("output_folder", "")
+        return os.path.normpath(folder) if folder else ""
+
+    video_dir = resolve_single_video_dir(stats)
+    return os.path.normpath(str(video_dir)) if video_dir else ""
+
+
+def resolve_preview_root(stats: dict) -> Path | None:
+    """Resolve the directory that contains the preview HTML and its relative assets."""
+    if stats.get("is_batch"):
+        folder = stats.get("output_folder", "")
+        return Path(os.path.normpath(folder)) if folder else None
+
+    video_dir = resolve_single_video_dir(stats)
+    return video_dir if video_dir else None
+
+
 def load_batch_stats(output_dir: str) -> dict | None:
     """
     Read _batch_summary.json produced by main.py's process_batch().
@@ -105,8 +150,15 @@ def load_batch_stats(output_dir: str) -> dict | None:
             total_blur   = sum(v.get("removed_blurry",      0) for v in video_results)
             total_dup    = sum(v.get("removed_duplicate",   0) for v in video_results)
             total_unique = sum(v.get("final_unique_frames", 0) for v in video_results)
-            success_n    = s.get("success", 0)
-            failed_n     = s.get("failed",  0)
+
+            derived_success = sum(1 for v in video_results if v.get("status") == "success")
+            derived_skipped = sum(1 for v in video_results if v.get("status") == "skipped")
+            derived_error   = sum(1 for v in video_results if v.get("status") == "error")
+
+            success_n = s.get("success", derived_success)
+            skipped_n = s.get("skipped", derived_skipped)
+            error_n   = s.get("error", derived_error)
+            failed_n  = s.get("failed", skipped_n + error_n)
 
             reduction = round(
                 100.0 * (total_raw - total_unique) / total_raw, 1
@@ -115,9 +167,11 @@ def load_batch_stats(output_dir: str) -> dict | None:
             batch_html  = output_path / "_batch_preview.html"
             return {
                 "is_batch":             True,
-                "total_videos":         s.get("total_videos", success_n + failed_n),
+                "total_videos":         s.get("total_videos", success_n + skipped_n + error_n),
                 "videos_processed":     success_n,
-                "videos_failed":        failed_n,
+                "videos_skipped":       skipped_n,
+                "videos_failed":        error_n,
+                "videos_non_success":   failed_n,
                 "total_raw_frames":     total_raw,
                 "removed_blurry":       total_blur,
                 "removed_duplicate":    total_dup,
@@ -181,7 +235,9 @@ def load_batch_stats(output_dir: str) -> dict | None:
         "is_batch":             True,
         "total_videos":         videos_found,
         "videos_processed":     videos_found,
+        "videos_skipped":       0,
         "videos_failed":        0,
+        "videos_non_success":   0,
         "total_raw_frames":     total_raw,
         "removed_blurry":       total_blur,
         "removed_duplicate":    total_dup,
@@ -375,17 +431,7 @@ def api_preview(job_id: str):
         return jsonify({"error": "No stats"}), 404
     stats = job["stats"]
 
-    if stats.get("is_batch"):
-        # Batch mode: use the master _batch_preview.html
-        preview = stats.get("batch_preview_path", "")
-        preview = os.path.normpath(preview) if preview else ""
-    else:
-        # Single video: <output_folder>/../preview.html
-        preview = os.path.join(
-            stats.get("output_folder", ""),
-            "..", "preview.html"
-        )
-        preview = os.path.normpath(preview)
+    preview = resolve_preview_path(stats)
 
     return jsonify({"path": preview, "exists": os.path.exists(preview)})
 
@@ -397,35 +443,62 @@ def api_serve_preview(job_id: str):
     This avoids browser security restrictions on file:// URLs.
     The frontend opens /api/serve-preview/<job_id> in a new tab.
     """
-    from flask import send_file
-
     job = JOBS.get(job_id)
     if not job or not job.get("stats"):
         return "Job not found or no stats available.", 404
 
     stats = job["stats"]
-
-    if stats.get("is_batch"):
-        preview_path = stats.get("batch_preview_path", "")
-    else:
-        folder = stats.get("output_folder", "")
-        parent = re.sub(r'[\\/]unique_frames[\\/]?$', '', folder)
-        preview_path = os.path.join(parent, "preview.html")
-
-    preview_path = os.path.normpath(preview_path) if preview_path else ""
+    preview_path = resolve_preview_path(stats)
+    preview_root = resolve_preview_root(stats)
 
     if not preview_path or not os.path.exists(preview_path):
+        safe_preview_path = html.escape(preview_path)
         return (
             "<html><body style='font-family:sans-serif;padding:40px;background:#0d1117;color:#e6edf3'>"
             "<h2>⚠ Preview file not found</h2>"
-            f"<p>Expected: <code>{preview_path}</code></p>"
+            f"<p>Expected: <code>{safe_preview_path}</code></p>"
             "<p>Make sure <b>Skip HTML Preview Generation</b> is NOT checked.</p>"
             "</body></html>",
             404,
             {"Content-Type": "text/html; charset=utf-8"}
         )
 
-    return send_file(preview_path, mimetype="text/html")
+    with open(preview_path, "r", encoding="utf-8") as f:
+        preview_html = f.read()
+
+    if preview_root:
+        base_href = f"/api/serve-preview-assets/{job_id}/"
+        if "<head>" in preview_html:
+            preview_html = preview_html.replace(
+                "<head>",
+                f'<head>\n  <base href="{html.escape(base_href, quote=True)}">',
+                1,
+            )
+
+    return Response(preview_html, mimetype="text/html")
+
+
+@app.route("/api/serve-preview-assets/<job_id>/<path:asset_path>")
+def api_serve_preview_asset(job_id: str, asset_path: str):
+    """Serve assets referenced by preview HTML when opened through Flask."""
+    job = JOBS.get(job_id)
+    if not job or not job.get("stats"):
+        return "Job not found or no stats available.", 404
+
+    preview_root = resolve_preview_root(job["stats"])
+    if not preview_root or not preview_root.exists():
+        return "Preview root not found.", 404
+
+    asset_full_path = (preview_root / asset_path).resolve()
+    try:
+        asset_full_path.relative_to(preview_root.resolve())
+    except ValueError:
+        return "Asset path is outside preview root.", 403
+
+    if not asset_full_path.exists() or not asset_full_path.is_file():
+        return "Preview asset not found.", 404
+
+    return send_from_directory(str(preview_root), asset_path)
 
 
 # ─────────────────────────────────────────────
