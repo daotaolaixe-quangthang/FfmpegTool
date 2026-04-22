@@ -1,0 +1,1295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FfmpegTool — Video Frame Extractor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    /* ═══════════════════════════════════════
+       DESIGN TOKENS
+    ═══════════════════════════════════════ */
+    :root {
+      --bg:         #080b14;
+      --surface:    #0e1420;
+      --surface2:   #141c2e;
+      --border:     rgba(99,140,255,0.12);
+      --border-hi:  rgba(99,140,255,0.35);
+      --accent:     #4f8cff;
+      --accent2:    #7c3aed;
+      --green:      #22c55e;
+      --red:        #ef4444;
+      --yellow:     #f59e0b;
+      --text:       #e2e8f0;
+      --text-muted: #64748b;
+      --text-dim:   #94a3b8;
+      --glass:      rgba(14,20,32,0.85);
+      --radius:     12px;
+      --radius-sm:  8px;
+    }
+
+    /* ═══════════════════════════════════════
+       RESET & BASE
+    ═══════════════════════════════════════ */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Animated background */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 80% 60% at 20% 10%, rgba(79,140,255,0.06) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 50% at 80% 80%, rgba(124,58,237,0.07) 0%, transparent 60%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ═══════════════════════════════════════
+       LAYOUT
+    ═══════════════════════════════════════ */
+    .app-wrapper {
+      position: relative;
+      z-index: 1;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px 20px 60px;
+    }
+
+    /* ═══════════════════════════════════════
+       HEADER
+    ═══════════════════════════════════════ */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 32px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .logo {
+      width: 44px;
+      height: 44px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      flex-shrink: 0;
+      box-shadow: 0 0 20px rgba(79,140,255,0.3);
+    }
+
+    header h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #e2e8f0 30%, #7eb8f7);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    header p {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    /* ═══════════════════════════════════════
+       GRID LAYOUT
+    ═══════════════════════════════════════ */
+    .main-grid {
+      display: grid;
+      grid-template-columns: 380px 1fr;
+      gap: 20px;
+      align-items: start;
+    }
+
+    @media (max-width: 860px) {
+      .main-grid { grid-template-columns: 1fr; }
+    }
+
+    /* ═══════════════════════════════════════
+       CARD
+    ═══════════════════════════════════════ */
+    .card {
+      background: var(--glass);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      backdrop-filter: blur(12px);
+    }
+
+    .card-title {
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .card-title::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    /* ═══════════════════════════════════════
+       INPUT SOURCE TOGGLE
+    ═══════════════════════════════════════ */
+    .source-tabs {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 14px;
+      background: rgba(0,0,0,0.3);
+      border-radius: var(--radius-sm);
+      padding: 4px;
+    }
+
+    .source-tab {
+      flex: 1;
+      padding: 7px;
+      font-size: 0.78rem;
+      font-weight: 500;
+      border: none;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .source-tab.active {
+      background: var(--accent);
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(79,140,255,0.35);
+    }
+
+    /* ═══════════════════════════════════════
+       FORM FIELDS
+    ═══════════════════════════════════════ */
+    .field { margin-bottom: 14px; }
+
+    label {
+      display: block;
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: var(--text-dim);
+      margin-bottom: 6px;
+    }
+
+    input[type="text"], input[type="number"], select {
+      width: 100%;
+      background: rgba(0,0,0,0.35);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 9px 12px;
+      font-size: 0.82rem;
+      color: var(--text);
+      font-family: inherit;
+      transition: border-color 0.2s;
+      outline: none;
+    }
+
+    input[type="text"]:focus,
+    input[type="number"]:focus,
+    select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(79,140,255,0.15);
+    }
+
+    select {
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2364748b'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 12px center;
+      padding-right: 30px;
+      cursor: pointer;
+    }
+
+    /* ═══════════════════════════════════════
+       SLIDERS
+    ═══════════════════════════════════════ */
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .slider-val {
+      min-width: 42px;
+      text-align: right;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--accent);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    input[type="range"] {
+      -webkit-appearance: none;
+      flex: 1;
+      height: 4px;
+      background: rgba(99,140,255,0.2);
+      border-radius: 2px;
+      outline: none;
+      cursor: pointer;
+    }
+
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      background: var(--accent);
+      border-radius: 50%;
+      box-shadow: 0 0 8px rgba(79,140,255,0.5);
+      transition: transform 0.15s;
+    }
+
+    input[type="range"]::-webkit-slider-thumb:hover {
+      transform: scale(1.2);
+    }
+
+    /* ═══════════════════════════════════════
+       TOGGLE SWITCH
+    ═══════════════════════════════════════ */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+
+    .toggle-label {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+    }
+
+    .toggle {
+      position: relative;
+      width: 38px;
+      height: 20px;
+    }
+
+    .toggle input { display: none; }
+
+    .toggle-slider {
+      position: absolute;
+      inset: 0;
+      background: rgba(255,255,255,0.1);
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .toggle-slider::before {
+      content: '';
+      position: absolute;
+      width: 14px;
+      height: 14px;
+      background: #fff;
+      border-radius: 50%;
+      top: 3px;
+      left: 3px;
+      transition: left 0.2s;
+    }
+
+    .toggle input:checked + .toggle-slider {
+      background: var(--accent);
+    }
+
+    .toggle input:checked + .toggle-slider::before {
+      left: 21px;
+    }
+
+    /* ═══════════════════════════════════════
+       RUN BUTTON
+    ═══════════════════════════════════════ */
+    #btn-run {
+      width: 100%;
+      padding: 13px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border: none;
+      border-radius: var(--radius-sm);
+      color: #fff;
+      font-size: 0.9rem;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      cursor: pointer;
+      transition: all 0.2s;
+      box-shadow: 0 4px 20px rgba(79,140,255,0.3);
+      margin-top: 18px;
+    }
+
+    #btn-run:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 24px rgba(79,140,255,0.45);
+    }
+
+    #btn-run:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    /* ═══════════════════════════════════════
+       RIGHT PANEL
+    ═══════════════════════════════════════ */
+    .right-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* ═══════════════════════════════════════
+       STATUS BAR
+    ═══════════════════════════════════════ */
+    #status-bar {
+      display: none;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      background: rgba(79,140,255,0.08);
+      border: 1px solid rgba(79,140,255,0.2);
+      border-radius: var(--radius-sm);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      flex-shrink: 0;
+    }
+
+    .status-dot.pulse {
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(79,140,255,0.5); }
+      50% { box-shadow: 0 0 0 6px rgba(79,140,255,0); }
+    }
+
+    .status-dot.green { background: var(--green); }
+    .status-dot.red { background: var(--red); }
+
+    #status-text {
+      font-size: 0.82rem;
+      color: var(--text-dim);
+    }
+
+    /* ═══════════════════════════════════════
+       TERMINAL
+    ═══════════════════════════════════════ */
+    .terminal-wrap {
+      position: relative;
+    }
+
+    .terminal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+
+    #btn-clear {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 2px 8px;
+      border-radius: 4px;
+      transition: color 0.2s;
+    }
+    #btn-clear:hover { color: var(--text); }
+
+    #terminal {
+      background: #050810;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 14px;
+      height: 340px;
+      overflow-y: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      line-height: 1.6;
+      scroll-behavior: smooth;
+    }
+
+    .log-line {
+      color: var(--text-dim);
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .log-line.ok    { color: #4ade80; }
+    .log-line.err   { color: #f87171; }
+    .log-line.info  { color: #60a5fa; }
+    .log-line.warn  { color: #fbbf24; }
+    .log-line.score { color: #a78bfa; }
+    .log-line.sep   { color: #334155; }
+
+    /* ═══════════════════════════════════════
+       STATS CARDS
+    ═══════════════════════════════════════ */
+    #results-panel { display: none; }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    @media (max-width: 600px) {
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    .stat-card {
+      background: rgba(0,0,0,0.4);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 14px 12px;
+      text-align: center;
+    }
+
+    .stat-num {
+      font-size: 1.8rem;
+      font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      display: block;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+
+    .stat-num.blue   { color: var(--accent); }
+    .stat-num.red    { color: #f87171; }
+    .stat-num.green  { color: #4ade80; }
+    .stat-num.purple { color: #a78bfa; }
+
+    .stat-lbl {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    /* ═══════════════════════════════════════
+       ACTION BUTTONS
+    ═══════════════════════════════════════ */
+    .action-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      padding: 9px 16px;
+      border-radius: var(--radius-sm);
+      font-size: 0.78rem;
+      font-weight: 500;
+      border: 1px solid;
+      cursor: pointer;
+      transition: all 0.2s;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: #3b7df5;
+      box-shadow: 0 4px 12px rgba(79,140,255,0.3);
+    }
+
+    .btn-secondary {
+      background: transparent;
+      border-color: var(--border-hi);
+      color: var(--text-dim);
+    }
+    .btn-secondary:hover {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+
+    /* ═══════════════════════════════════════
+       COMMAND PREVIEW
+    ═══════════════════════════════════════ */
+    #cmd-preview {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.68rem;
+      background: rgba(0,0,0,0.4);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 10px 12px;
+      color: var(--text-muted);
+      white-space: pre-wrap;
+      word-break: break-all;
+      margin-top: 14px;
+      line-height: 1.5;
+    }
+
+    /* ═══════════════════════════════════════
+       BATCH TABLE
+    ═══════════════════════════════════════ */
+    .batch-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: linear-gradient(135deg, rgba(124,58,237,0.25), rgba(79,140,255,0.2));
+      border: 1px solid rgba(124,58,237,0.4);
+      border-radius: 20px;
+      padding: 3px 12px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: #a78bfa;
+      margin-bottom: 14px;
+    }
+
+    /* Batch summary bar: success / failed chips */
+    .batch-summary-bar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .bsb-chip {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 14px;
+      border-radius: 8px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      border: 1px solid;
+    }
+    .bsb-chip.total  { background: rgba(79,140,255,0.1);  border-color: rgba(79,140,255,0.35); color: #7eb8f7; }
+    .bsb-chip.ok     { background: rgba(74,222,128,0.1);  border-color: rgba(74,222,128,0.35); color: #4ade80; }
+    .bsb-chip.fail   { background: rgba(248,113,113,0.1); border-color: rgba(248,113,113,0.35);color: #f87171; }
+    .bsb-chip .bsb-num { font-size: 1.1rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+
+    .batch-table-wrap {
+      margin-top: 14px;
+      overflow-x: auto;
+    }
+
+    .batch-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.75rem;
+    }
+
+    .batch-table th {
+      text-align: left;
+      padding: 7px 10px;
+      color: var(--text-muted);
+      font-weight: 600;
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .batch-table td {
+      padding: 7px 10px;
+      color: var(--text-dim);
+      border-bottom: 1px solid rgba(99,140,255,0.06);
+      font-family: 'JetBrains Mono', monospace;
+      vertical-align: top;
+    }
+
+    .batch-table tr:hover td {
+      background: rgba(79,140,255,0.04);
+    }
+
+    .batch-table td:nth-child(2) {   /* video name col */
+      color: var(--text);
+      font-family: inherit;
+      max-width: 200px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Status badge */
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.68rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .status-badge.ok     { background: rgba(74,222,128,0.15);  color: #4ade80; border: 1px solid rgba(74,222,128,0.3); }
+    .status-badge.err    { background: rgba(248,113,113,0.15); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }
+    .status-badge.skip   { background: rgba(251,191,36,0.15);  color: #fbbf24; border: 1px solid rgba(251,191,36,0.3); }
+
+    /* Error reason cell */
+    .error-reason {
+      font-size: 0.68rem;
+      color: #f87171;
+      font-family: 'JetBrains Mono', monospace;
+      white-space: normal;
+      word-break: break-word;
+      margin-top: 3px;
+      max-width: 300px;
+    }
+
+    .td-green { color: #4ade80 !important; }
+    .td-red   { color: #f87171 !important; }
+    .td-dim   { color: var(--text-muted) !important; }
+
+    /* ═══════════════════════════════════════
+       MISC
+    ═══════════════════════════════════════ */
+    hr.divider {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 14px 0;
+    }
+
+    .hidden { display: none !important; }
+
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(99,140,255,0.2); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(99,140,255,0.4); }
+  </style>
+</head>
+<body>
+<div class="app-wrapper">
+
+  <!-- ══ HEADER ══ -->
+  <header>
+    <div class="logo">🎬</div>
+    <div>
+      <h1>FfmpegTool</h1>
+      <p>Video Frame Extractor &amp; Smart Filter — Blur · Dedup · Aesthetic Score</p>
+    </div>
+  </header>
+
+  <div class="main-grid">
+
+    <!-- ══════════════════════════════════════
+         LEFT: CONFIG PANEL
+    ══════════════════════════════════════ -->
+    <div class="left-panel">
+      <div class="card">
+        <div class="card-title">Input Source</div>
+
+        <!-- Source toggle -->
+        <div class="source-tabs">
+          <button class="source-tab active" id="tab-file" onclick="setSource('file')">Local File</button>
+          <button class="source-tab" id="tab-url"  onclick="setSource('url')">URL (TikTok/YT)</button>
+          <button class="source-tab" id="tab-batch" onclick="setSource('batch')">Batch Folder</button>
+        </div>
+
+        <!-- File input -->
+        <div class="field" id="src-file">
+          <label>Video File Path</label>
+          <input type="text" id="input-path" placeholder="G:\Videos\clip.mp4">
+        </div>
+
+        <!-- URL input -->
+        <div class="field hidden" id="src-url">
+          <label>Video URL</label>
+          <input type="text" id="input-url" placeholder="https://www.tiktok.com/...">
+        </div>
+
+        <!-- Batch input -->
+        <div class="field hidden" id="src-batch">
+          <label>Videos Folder Path</label>
+          <input type="text" id="input-batch" placeholder="G:\Videos\">
+        </div>
+
+        <!-- Output -->
+        <div class="field">
+          <label>Output Folder</label>
+          <input type="text" id="output-path" placeholder="G:\Frames">
+        </div>
+
+        <hr class="divider">
+        <div class="card-title">Extraction</div>
+
+        <!-- Mode -->
+        <div class="field">
+          <label>Mode</label>
+          <select id="mode" onchange="updateMode()">
+            <option value="fps">FPS — extract N frames per second</option>
+            <option value="scene">Scene — extract at scene changes (smarter)</option>
+          </select>
+        </div>
+
+        <!-- FPS slider -->
+        <div class="field" id="fps-field">
+          <label>Frames Per Second</label>
+          <div class="slider-row">
+            <input type="range" id="fps" min="1" max="30" step="1" value="5"
+                   oninput="sync('fps', 'fps-val')">
+            <span class="slider-val" id="fps-val">5</span>
+          </div>
+        </div>
+
+        <hr class="divider">
+        <div class="card-title">Filters</div>
+
+        <!-- Blur threshold -->
+        <div class="field">
+          <label>Blur Threshold <span style="color:var(--text-muted);font-weight:400">(Laplacian variance — lower removes more)</span></label>
+          <div class="slider-row">
+            <input type="range" id="blur" min="20" max="300" step="5" value="80"
+                   oninput="sync('blur', 'blur-val')">
+            <span class="slider-val" id="blur-val">80</span>
+          </div>
+        </div>
+
+        <!-- Similarity threshold -->
+        <div class="field">
+          <label>Max Similarity to Keep Frame <span style="color:var(--text-muted);font-weight:400">(0.70 = keep frames 30%+ different)</span></label>
+          <div class="slider-row">
+            <input type="range" id="sim" min="0.30" max="0.98" step="0.01" value="0.70"
+                   oninput="sync('sim', 'sim-val', true)">
+            <span class="slider-val" id="sim-val">0.70</span>
+          </div>
+        </div>
+
+        <!-- Dedup method -->
+        <div class="field">
+          <label>Dedup Method</label>
+          <select id="method">
+            <option value="phash">pHash — fast, recommended</option>
+            <option value="ssim">SSIM — accurate, slower</option>
+          </select>
+        </div>
+
+        <hr class="divider">
+        <div class="card-title">Aesthetic Scorer</div>
+
+        <div class="toggle-row">
+          <span class="toggle-label">Enable Scorer (select top-N best frames)</span>
+          <label class="toggle">
+            <input type="checkbox" id="score-enabled" onchange="toggleScorer()">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <!-- Top N -->
+        <div class="field hidden" id="top-n-field">
+          <label>Top N Frames to Select</label>
+          <div class="slider-row">
+            <input type="range" id="top-n" min="5" max="100" step="5" value="25"
+                   oninput="sync('top-n', 'top-n-val')">
+            <span class="slider-val" id="top-n-val">25</span>
+          </div>
+        </div>
+
+        <hr class="divider">
+        <div class="card-title">Options</div>
+
+        <div class="toggle-row">
+          <span class="toggle-label">Keep Raw Frames (don't delete after filter)</span>
+          <label class="toggle">
+            <input type="checkbox" id="keep-raw">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="toggle-row">
+          <span class="toggle-label">Skip HTML Preview Generation</span>
+          <label class="toggle">
+            <input type="checkbox" id="no-html">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <!-- Command preview -->
+        <div id="cmd-preview">python main.py ...</div>
+
+        <!-- Run button -->
+        <button id="btn-run" onclick="runPipeline()">▶ Run Pipeline</button>
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════
+         RIGHT: OUTPUT PANEL
+    ══════════════════════════════════════ -->
+    <div class="right-panel">
+
+      <!-- Status bar -->
+      <div id="status-bar">
+        <div class="status-dot pulse" id="status-dot"></div>
+        <span id="status-text">Initializing...</span>
+      </div>
+
+      <!-- Terminal -->
+      <div class="card terminal-wrap">
+        <div class="terminal-header">
+          <div class="card-title" style="margin:0">Live Output</div>
+          <button id="btn-clear" onclick="clearTerminal()">Clear</button>
+        </div>
+        <div id="terminal">
+          <div class="log-line sep">═══ FfmpegTool Web UI — Ready ═══</div>
+          <div class="log-line sep">Configure settings and click Run Pipeline.</div>
+        </div>
+      </div>
+
+      <!-- Results panel -->
+      <div class="card" id="results-panel">
+        <div class="card-title">Results</div>
+
+        <div class="stats-grid">
+          <div class="stat-card">
+            <span class="stat-num blue" id="s-raw">—</span>
+            <span class="stat-lbl">Raw Frames</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-num red" id="s-blur">—</span>
+            <span class="stat-lbl">Blurry Removed</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-num red" id="s-dup">—</span>
+            <span class="stat-lbl">Duplicates Removed</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-num green" id="s-unique">—</span>
+            <span class="stat-lbl">Unique Kept</span>
+          </div>
+        </div>
+
+        <div class="stats-grid" id="s-row2" style="display:none">
+          <div class="stat-card">
+            <span class="stat-num purple" id="s-top">—</span>
+            <span class="stat-lbl">Top Frames Selected</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-num blue" id="s-reduction">—</span>
+            <span class="stat-lbl">Reduction Rate</span>
+          </div>
+        </div>
+
+        <div class="action-row" id="result-actions">
+          <button class="btn btn-primary" id="btn-open-folder" onclick="openFolder()">
+            📁 Open Output Folder
+          </button>
+          <button class="btn btn-secondary" id="btn-preview" onclick="openPreview()">
+            🖼 View HTML Preview
+          </button>
+          <button class="btn btn-secondary" onclick="runPipeline()">
+            ↺ Run Again
+          </button>
+        </div>
+
+        <!-- Batch per-video breakdown table (hidden for single video) -->
+        <div id="batch-table-wrap" class="batch-table-wrap" style="display:none">
+          <hr class="divider">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+            <div class="card-title" style="margin:0">Per-Video Breakdown</div>
+            <div id="batch-summary-bar" class="batch-summary-bar"></div>
+          </div>
+          <table class="batch-table">
+            <thead>
+              <tr>
+                <th style="width:32px">#</th>
+                <th>Video</th>
+                <th style="width:80px">Status</th>
+                <th>Raw</th>
+                <th>Blurry ↓</th>
+                <th>Dups ↓</th>
+                <th>Unique ✓</th>
+              </tr>
+            </thead>
+            <tbody id="batch-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+  // ═══════════════════════════════════════
+  // STATE
+  // ═══════════════════════════════════════
+  let currentSource = 'file';
+  let currentJobId  = null;
+  let currentStats  = null;
+  let eventSource   = null;
+
+  // ═══════════════════════════════════════
+  // SOURCE TOGGLE
+  // ═══════════════════════════════════════
+  function setSource(mode) {
+    currentSource = mode;
+    ['file','url','batch'].forEach(s => {
+      document.getElementById(`tab-${s}`).classList.toggle('active', s === mode);
+      document.getElementById(`src-${s}`).classList.toggle('hidden', s !== mode);
+    });
+    updateCmdPreview();
+  }
+
+  // ═══════════════════════════════════════
+  // SLIDER SYNC
+  // ═══════════════════════════════════════
+  function sync(inputId, displayId, isFloat = false) {
+    const val = document.getElementById(inputId).value;
+    document.getElementById(displayId).textContent = isFloat
+      ? parseFloat(val).toFixed(2)
+      : val;
+    updateCmdPreview();
+  }
+
+  function updateMode() {
+    const mode = document.getElementById('mode').value;
+    document.getElementById('fps-field').classList.toggle('hidden', mode === 'scene');
+    updateCmdPreview();
+  }
+
+  function toggleScorer() {
+    const on = document.getElementById('score-enabled').checked;
+    document.getElementById('top-n-field').classList.toggle('hidden', !on);
+    updateCmdPreview();
+  }
+
+  // Auto-update preview on input changes
+  ['input-path','input-url','input-batch','output-path'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', updateCmdPreview);
+  });
+  ['mode','method','keep-raw','no-html','fps','blur','sim','top-n']
+    .forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('change', updateCmdPreview);
+    });
+
+  // ═══════════════════════════════════════
+  // COMMAND PREVIEW
+  // ═══════════════════════════════════════
+  function buildPayload() {
+    return {
+      url:      currentSource === 'url'   ? document.getElementById('input-url').value   : '',
+      input:    currentSource === 'file'  ? document.getElementById('input-path').value  :
+                currentSource === 'batch' ? document.getElementById('input-batch').value : '',
+      batch:    currentSource === 'batch',
+      output:   document.getElementById('output-path').value,
+      mode:     document.getElementById('mode').value,
+      fps:      parseFloat(document.getElementById('fps').value),
+      blur:     parseFloat(document.getElementById('blur').value),
+      sim:      parseFloat(document.getElementById('sim').value),
+      method:   document.getElementById('method').value,
+      top_n:    document.getElementById('score-enabled').checked
+                ? parseInt(document.getElementById('top-n').value) : 0,
+      keep_raw: document.getElementById('keep-raw').checked,
+      no_html:  document.getElementById('no-html').checked,
+    };
+  }
+
+  function updateCmdPreview() {
+    const d = buildPayload();
+    let parts = ['python main.py'];
+    if (d.url)         parts.push(`--url "${d.url}"`);
+    else if (d.batch)  parts.push(`--batch "${d.input}"`);
+    else if (d.input)  parts.push(`--input "${d.input}"`);
+    if (d.output)      parts.push(`--output "${d.output}"`);
+    parts.push(`--mode ${d.mode}`);
+    if (d.mode === 'fps') parts.push(`--fps ${d.fps}`);
+    parts.push(`--blur ${d.blur}`);
+    parts.push(`--sim ${d.sim.toFixed(2)}`);
+    parts.push(`--method ${d.method}`);
+    if (d.top_n > 0)   parts.push(`--top ${d.top_n}`);
+    if (d.keep_raw)    parts.push('--keep-raw');
+    if (d.no_html)     parts.push('--no-html');
+    document.getElementById('cmd-preview').textContent = parts.join(' ');
+  }
+
+  // ═══════════════════════════════════════
+  // TERMINAL
+  // ═══════════════════════════════════════
+  function addLog(text, cls = '') {
+    const term = document.getElementById('terminal');
+    const div = document.createElement('div');
+    div.className = 'log-line' + (cls ? ' ' + cls : '');
+    div.textContent = text;
+    term.appendChild(div);
+    term.scrollTop = term.scrollHeight;
+  }
+
+  function clearTerminal() {
+    document.getElementById('terminal').innerHTML = '';
+  }
+
+  function classifyLog(line) {
+    if (line.includes('[OK]') || line.includes('DONE') || line.includes('HOAN')) return 'ok';
+    if (line.includes('[ERROR]') || line.includes('Error') || line.includes('error')) return 'err';
+    if (line.includes('[EXTRACT]') || line.includes('[DEDUP]') || line.includes('[REPORT]')) return 'info';
+    if (line.includes('[SCORE]') || line.includes('score') || line.includes('Total')) return 'score';
+    if (line.includes('[BLUR]') || line.includes('[WARN]') || line.includes('WARN')) return 'warn';
+    if (line.match(/^[=─]+$/) || line.includes('===')) return 'sep';
+    return '';
+  }
+
+  // ═══════════════════════════════════════
+  // RUN PIPELINE
+  // ═══════════════════════════════════════
+  async function runPipeline() {
+    // Close previous SSE
+    if (eventSource) { eventSource.close(); }
+
+    const payload = buildPayload();
+
+    // Validate
+    if (!payload.url && !payload.input) {
+      addLog('[ERROR] Please enter a video path or URL.', 'err'); return;
+    }
+    if (!payload.output) {
+      addLog('[ERROR] Please enter an output folder.', 'err'); return;
+    }
+
+    // UI state
+    document.getElementById('btn-run').disabled = true;
+    document.getElementById('results-panel').style.display = 'none';
+    clearTerminal();
+
+    const statusBar = document.getElementById('status-bar');
+    statusBar.style.display = 'flex';
+    const dot = document.getElementById('status-dot');
+    dot.className = 'status-dot pulse';
+    document.getElementById('status-text').textContent = 'Starting pipeline...';
+
+    addLog('═══ Starting FfmpegTool Pipeline ═══', 'sep');
+    addLog(document.getElementById('cmd-preview').textContent, 'info');
+    addLog('', '');
+
+    // POST to /api/run
+    let resp;
+    try {
+      resp = await fetch('/api/run', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+    } catch(e) {
+      addLog(`[ERROR] Server error: ${e}`, 'err');
+      document.getElementById('btn-run').disabled = false;
+      return;
+    }
+
+    const data = await resp.json();
+    if (data.error) {
+      addLog(`[ERROR] ${data.error}`, 'err');
+      document.getElementById('btn-run').disabled = false;
+      return;
+    }
+
+    currentJobId = data.job_id;
+    document.getElementById('status-text').textContent = `Running... (job: ${currentJobId})`;
+
+    // SSE stream
+    eventSource = new EventSource(`/api/stream/${currentJobId}`);
+
+    eventSource.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+
+      if (msg.type === 'log') {
+        const cls = classifyLog(msg.text);
+        addLog(msg.text, cls);
+
+      } else if (msg.type === 'done') {
+        eventSource.close();
+        document.getElementById('btn-run').disabled = false;
+
+        const success = msg.exit_code === '0';
+        dot.className = `status-dot ${success ? 'green' : 'red'}`;
+        document.getElementById('status-text').textContent =
+          success ? 'Pipeline completed successfully.' : 'Pipeline finished with errors.';
+
+        addLog('', '');
+        addLog(success ? '═══ Pipeline Complete ═══' : '═══ Pipeline Ended With Errors ═══',
+               success ? 'ok' : 'err');
+
+        if (success && msg.stats) {
+          currentStats = msg.stats;
+          showResults(msg.stats);
+        }
+
+      } else if (msg.type === 'ping') {
+        // keep-alive, ignore
+      }
+    };
+
+    eventSource.onerror = () => {
+      addLog('[ERROR] Lost connection to server.', 'err');
+      document.getElementById('btn-run').disabled = false;
+    };
+  }
+
+  // ═══════════════════════════════════════
+  // RESULTS PANEL
+  // ═══════════════════════════════════════
+  function showResults(stats) {
+    document.getElementById('results-panel').style.display = 'block';
+
+    // Remove old batch badge if present
+    const oldBadge = document.getElementById('batch-badge');
+    if (oldBadge) oldBadge.remove();
+
+    const isBatch   = stats.is_batch || false;
+    const raw       = stats.total_raw_frames   ?? '—';
+    const blur      = stats.removed_blurry     ?? '—';
+    const dup       = stats.removed_duplicate  ?? '—';
+    const unique    = stats.final_unique_frames ?? '—';
+    const topN      = stats.top_n_selected;
+    const reduction = stats.reduction_rate     ?? '—';
+
+    // Inject batch badge above stats grid
+    if (isBatch) {
+      const badge = document.createElement('div');
+      badge.id = 'batch-badge';
+      badge.className = 'batch-badge';
+      const total   = stats.total_videos    ?? stats.videos_processed ?? 0;
+      const success = stats.videos_processed ?? 0;
+      const failed  = stats.videos_failed   ?? 0;
+      badge.innerHTML = `🗂 Batch — ${total} video${total !== 1 ? 's' : ''} found`;
+      document.querySelector('#results-panel .stats-grid').before(badge);
+    }
+
+    document.getElementById('s-raw').textContent    = raw;
+    document.getElementById('s-blur').textContent   = blur;
+    document.getElementById('s-dup').textContent    = dup;
+    document.getElementById('s-unique').textContent = unique;
+
+    const row2 = document.getElementById('s-row2');
+    if (topN) {
+      row2.style.display = 'grid';
+      document.getElementById('s-top').textContent       = topN;
+      document.getElementById('s-reduction').textContent = reduction;
+    } else {
+      row2.style.display = 'none';
+    }
+
+    // Batch per-video table
+    const tableWrap = document.getElementById('batch-table-wrap');
+    const tbody     = document.getElementById('batch-tbody');
+    const summaryBar = document.getElementById('batch-summary-bar');
+
+    if (isBatch && Array.isArray(stats.video_results) && stats.video_results.length > 0) {
+      tbody.innerHTML = '';
+      summaryBar.innerHTML = '';
+
+      const total   = stats.total_videos    ?? stats.video_results.length;
+      const success = stats.videos_processed ?? stats.video_results.filter(v => v.status === 'success').length;
+      const failed  = stats.videos_failed   ?? stats.video_results.filter(v => v.status !== 'success').length;
+
+      // Summary chips
+      summaryBar.innerHTML = `
+        <div class="bsb-chip total">
+          <span class="bsb-num">${total}</span> Total
+        </div>
+        <div class="bsb-chip ok">
+          <span class="bsb-num">${success}</span> ✓ Done
+        </div>
+        ${failed > 0 ? `<div class="bsb-chip fail"><span class="bsb-num">${failed}</span> ✕ Failed</div>` : ''}
+      `;
+
+      stats.video_results.forEach((v, idx) => {
+        const status = v.status || 'success';
+        const isOk   = status === 'success';
+        const isSkip = status === 'skipped';
+
+        // Status badge
+        let badgeHtml;
+        if (isOk) {
+          badgeHtml = `<span class="status-badge ok">✓ Done</span>`;
+        } else if (isSkip) {
+          badgeHtml = `<span class="status-badge skip">⚠ Skipped</span>`;
+        } else {
+          badgeHtml = `<span class="status-badge err">✕ Error</span>`;
+        }
+
+        // Error reason (shown below badge for failed/skipped)
+        const errorHtml = (!isOk && v.error)
+          ? `<div class="error-reason" title="${v.error.replace(/"/g,'&quot;')}">${v.error}</div>`
+          : '';
+
+        const numCls = isOk ? '' : ' td-dim';
+
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td style="color:var(--text-muted)">${v.index ?? (idx + 1)}</td>
+          <td title="${v.video_name}">${v.video_name}</td>
+          <td>${badgeHtml}${errorHtml}</td>
+          <td class="${isOk ? '' : 'td-dim'}">${isOk ? v.total_raw_frames : '—'}</td>
+          <td class="td-red${numCls}">${isOk ? v.removed_blurry : '—'}</td>
+          <td class="td-red${numCls}">${isOk ? v.removed_duplicate : '—'}</td>
+          <td class="td-green${numCls}">${isOk ? v.final_unique_frames : '—'}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+      tableWrap.style.display = 'block';
+    } else {
+      tableWrap.style.display = 'none';
+      if (summaryBar) summaryBar.innerHTML = '';
+    }
+  }
+
+  // ═══════════════════════════════════════
+  // OPEN FOLDER / PREVIEW
+  // ═══════════════════════════════════════
+  async function openFolder() {
+    if (!currentStats) return;
+
+    let folder;
+    if (currentStats.is_batch) {
+      // For batch: open the root output folder
+      folder = currentStats.output_folder || '';
+    } else {
+      // For single video: go up from unique_frames/ to the video folder
+      folder = (currentStats.output_folder || '').replace(/[\\\/]unique_frames[\\\/]?$/, '');
+    }
+
+    await fetch('/api/open-folder', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({folder: folder})
+    });
+  }
+
+  async function openPreview() {
+    if (!currentJobId) {
+      addLog('[WARN] No active job to preview. Run the pipeline first.', 'warn');
+      return;
+    }
+    // Open the preview via Flask server endpoint — avoids browser file:// security block
+    window.open(`/api/serve-preview/${currentJobId}`, '_blank');
+  }
+
+  // ═══════════════════════════════════════
+  // INIT
+  // ═══════════════════════════════════════
+  updateCmdPreview();
+</script>
+</body>
+</html>

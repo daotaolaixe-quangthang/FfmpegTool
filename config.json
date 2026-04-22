@@ -1,0 +1,38 @@
+{
+  "_comment": "FfmpegTool default config — edit freely",
+
+  "extraction": {
+    "fps": 5,
+    "mode": "fps",
+    "_mode_options": ["fps", "scene"],
+    "scene_threshold": 27.0,
+    "jpeg_quality": 2,
+    "_jpeg_quality_note": "1=best quality, 31=worst"
+  },
+
+  "filter": {
+    "blur_threshold": 80.0,
+    "_blur_note": "Laplacian variance. Lower = more frames removed. Recommended: 60-120",
+    "similarity_threshold": 0.70,
+    "_similarity_note": "pHash similarity 0.0-1.0. Frames >= this are considered duplicate. 0.70 = keep frames 30%+ different",
+    "dedup_method": "phash",
+    "_dedup_method_options": ["phash", "ssim"],
+    "_dedup_method_note": "phash=fast (recommended), ssim=slower but more accurate (use for <500 frames)",
+    "phash_size": 16
+  },
+
+  "scorer": {
+    "enabled": false,
+    "_enabled_note": "Set true to score frames aesthetically and select top-N after filtering",
+    "top_n": 30,
+    "_top_n_note": "How many best-scoring frames to copy into top_frames/ folder",
+    "save_score_report": true
+  },
+
+  "output": {
+    "keep_raw": false,
+    "generate_html_preview": true,
+    "preview_columns": 5,
+    "report_json": true
+  }
+}

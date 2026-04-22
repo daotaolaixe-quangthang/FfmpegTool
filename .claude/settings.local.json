@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile \"/e/FfmpegTool/main.py\" \"/e/FfmpegTool/app.py\" \"/e/FfmpegTool/extractor.py\" \"/e/FfmpegTool/filters.py\" \"/e/FfmpegTool/scorer.py\" \"/e/FfmpegTool/reporter.py\" \"/e/FfmpegTool/downloader.py\")",
+      "Bash(python \"/e/FfmpegTool/main.py\" --gen-batch-html --output \"/e/FfmpegTool\")",
+      "Bash(python \"/e/FfmpegTool/main.py\" --clean-empty --output \"/e/FfmpegTool\")",
+      "Bash(python \"/e/FfmpegTool/main.py\" --input \"/tmp/ffmpegtool_smoke.mp4\" --output \"/tmp/ffmpegtool_out_single_score\" --top 5)",
+      "Bash(python \"/e/FfmpegTool/main.py\" --input \"/tmp/ffmpegtool_smoke.mp4\" --output \"/tmp/ffmpegtool_repeat\")",
+      "Bash(python \"/e/FfmpegTool/main.py\" --input \"/tmp/ffmpegtool_smoke.mp4\" --output \"/tmp/ffmpegtool_scene\" --mode scene)",
+      "Bash(mkdir -p \"/tmp/ffmpegtool_batch_in\")",
+      "Bash(cp \"/tmp/ffmpegtool_smoke.mp4\" \"/tmp/ffmpegtool_batch_in/a.mp4\")",
+      "Bash(cp \"/tmp/ffmpegtool_smoke.mp4\" \"/tmp/ffmpegtool_batch_in/b.mp4\")",
+      "Bash(python \"/e/FfmpegTool/main.py\" --batch \"/tmp/ffmpegtool_batch_in\" --output \"/tmp/ffmpegtool_batch_out\")"
+    ]
+  }
+}
