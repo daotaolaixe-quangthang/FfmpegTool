@@ -71,7 +71,10 @@ def score_colorfulness(bgr: np.ndarray) -> float:
 def score_composition(gray: np.ndarray) -> float:
     """
     Rough composition score: fraction of edge pixels in the central
-    two-thirds of the frame (rule-of-thirds proxy).
+    region of the frame (rule-of-thirds proxy).
+    The sampled region covers the middle 50% vertically and horizontally
+    (h//4:3h//4, w//4:3w//4), then scaled by 1.5 to compensate for
+    the smaller area relative to frame total.
     """
     edges = cv2.Canny(gray, 80, 180)
     total_edges = float(np.sum(edges))
@@ -79,7 +82,7 @@ def score_composition(gray: np.ndarray) -> float:
         return 0.0
 
     h, w = edges.shape
-    # Central region: middle third vertically and horizontally
+    # Central region: middle half vertically and horizontally
     center = edges[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
     center_edges = float(np.sum(center))
     return min(center_edges / (total_edges + 1e-6) * 1.5, 1.0)
@@ -103,11 +106,26 @@ def score_frame(image_path: str) -> dict:
     Score a single frame on all aesthetic dimensions.
 
     Returns:
-        dict with individual scores and weighted total (all 0.0–1.0)
+        dict with individual scores and weighted total (all 0.0–1.0).
+        On unreadable images returns a full zero-score dict (SCORER-1 FIX)
+        so that downstream consumers (print_top_scores, select_top_n) never
+        encounter a KeyError due to missing keys.
     """
     bgr = cv2.imread(image_path)
     if bgr is None:
-        return {"total": 0.0, "error": "unreadable"}
+        # SCORER-1 FIX: always return dict with complete set of keys.
+        # A dict with missing keys causes KeyError in print_top_scores().
+        return {
+            "file"        : os.path.basename(image_path),
+            "path"        : image_path,
+            "sharpness"   : 0.0,
+            "colorfulness": 0.0,
+            "brightness"  : 0.0,
+            "contrast"    : 0.0,
+            "composition" : 0.0,
+            "total"       : 0.0,
+            "error"       : "unreadable",
+        }
 
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 

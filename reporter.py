@@ -52,9 +52,15 @@ def save_html_preview(final_paths: list[str], output_dir: str,
     """
 
     def img_to_data_uri(path: str) -> str:
-        with open(path, "rb") as f:
-            data = base64.b64encode(f.read()).decode()
-        return f"data:image/jpeg;base64,{data}"
+        # REPORTER-2 FIX: catch OSError if a frame file was deleted between
+        # dedup and preview generation (race condition / external tool).
+        # Returns empty string → browser shows broken image icon instead of crash.
+        try:
+            with open(path, "rb") as f:
+                data = base64.b64encode(f.read()).decode()
+            return f"data:image/jpeg;base64,{data}"
+        except OSError:
+            return ""
 
     safe_video_name = escape(video_name)
 
@@ -217,6 +223,12 @@ def save_html_preview(final_paths: list[str], output_dir: str,
     html_path = os.path.join(output_dir, "preview.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
+
+    # REPORTER-1: warn user if preview HTML is large (base64 frames can balloon fast)
+    size_mb = os.path.getsize(html_path) / (1024 * 1024)
+    if size_mb > 10:
+        print(f"[WARN] HTML preview is {size_mb:.0f}MB — may load slowly in browser. "
+              "Consider raising jpeg_quality (e.g. 5-8) or reducing fps.")
 
     return html_path
 
@@ -491,7 +503,9 @@ def save_batch_html_preview(batch_output_dir: str) -> str:
   <!-- Lightbox modal -->
   <div id="modal" onclick="closeModal()">
     <button id="modal-close" onclick="closeModal()">✕</button>
-    <img id="modal-img" src="" alt="">
+    <!-- REPORTER-3 FIX: stopPropagation so clicking the image itself does not
+         bubble up to the modal backdrop and close the lightbox. -->
+    <img id="modal-img" src="" alt="" onclick="event.stopPropagation()">
     <div id="modal-caption"></div>
   </div>
 

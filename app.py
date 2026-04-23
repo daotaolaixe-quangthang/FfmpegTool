@@ -210,8 +210,13 @@ def load_batch_stats(output_dir: str) -> dict | None:
                 "video_results":        video_results,  # includes status + error field
                 "generated_at":         s.get("generated_at"),
             }
-        except Exception:
-            pass  # fall through to legacy scan
+        except Exception as e:
+            # APP-2 FIX: log warning instead of silently swallowing the error.
+            # If _batch_summary.json exists but is malformed (e.g. truncated due
+            # to a crash mid-write), falling back silently gives stale data
+            # with no indication of why. Now the user sees a warning in the terminal.
+            print(f"[WARN] _batch_summary.json exists but failed to parse: {e}. "
+                  "Falling back to scanning individual report.json files.")
 
     # ── Fallback: scan individual report.json files (legacy behavior) ──
     total_raw    = 0
@@ -515,11 +520,16 @@ def api_serve_preview(job_id: str):
     preview_root = resolve_preview_root(stats)
 
     if not preview_path or not os.path.exists(preview_path):
-        safe_preview_path = html.escape(preview_path)
+        # APP-1 FIX: preview_path may be None (stats missing output_folder)
+        # or an empty string. Provide a meaningful message in both cases.
+        if preview_path:
+            path_hint = f"<p>Expected path: <code>{html.escape(preview_path)}</code></p>"
+        else:
+            path_hint = "<p>No preview path could be resolved from job stats.</p>"
         return (
             "<html><body style='font-family:sans-serif;padding:40px;background:#0d1117;color:#e6edf3'>"
             "<h2>⚠ Preview file not found</h2>"
-            f"<p>Expected: <code>{safe_preview_path}</code></p>"
+            f"{path_hint}"
             "<p>Make sure <b>Skip HTML Preview Generation</b> is NOT checked.</p>"
             "</body></html>",
             404,

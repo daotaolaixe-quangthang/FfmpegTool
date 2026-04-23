@@ -58,8 +58,13 @@ def load_config(config_path: str = "config.json") -> dict:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     full_path = os.path.join(script_dir, config_path)
     if os.path.exists(full_path):
-        with open(full_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            # MAIN-3 FIX: catch malformed config.json (e.g. user edit error) and
+            # fall back to defaults rather than crashing with an ugly traceback.
+            print(f"[WARN] config.json has invalid JSON ({e}). Using built-in defaults.")
     return {}
 
 
@@ -133,40 +138,44 @@ def process_video(video_path: str, output_dir: str, cfg: dict) -> dict:
     # Create output dir only AFTER confirming we have frames to process
     os.makedirs(video_output_dir, exist_ok=True)
 
-    # ── Steps 2 & 3: Filter (blur + dedup) ──
-    stats = run_filter_pipeline(raw_frames, video_output_dir, cfg["filter"])
-    stats["blur_threshold"]       = cfg["filter"].get("blur_threshold")
-    stats["similarity_threshold"] = cfg["filter"].get("similarity_threshold")
-    stats["dedup_method"]         = cfg["filter"].get("dedup_method", "phash")
+    try:
+        # ── Steps 2 & 3: Filter (blur + dedup) ──
+        stats = run_filter_pipeline(raw_frames, video_output_dir, cfg["filter"])
+        stats["blur_threshold"]       = cfg["filter"].get("blur_threshold")
+        stats["similarity_threshold"] = cfg["filter"].get("similarity_threshold")
+        stats["dedup_method"]         = cfg["filter"].get("dedup_method", "phash")
 
-    # ── Step 4 (Optional): Aesthetic scoring ──
-    scorer_cfg = cfg["scorer"]
-    stats["scorer_enabled"] = bool(scorer_cfg.get("enabled"))
-    stats["top_n_requested"] = scorer_cfg.get("top_n") if stats["scorer_enabled"] else None
-    stats["top_n_selected"] = 0 if stats["scorer_enabled"] else None
-    stats["top_frames_dir"] = None
-    stats["score_report_path"] = None
+        # ── Step 4 (Optional): Aesthetic scoring ──
+        scorer_cfg = cfg["scorer"]
+        stats["scorer_enabled"] = bool(scorer_cfg.get("enabled"))
+        stats["top_n_requested"] = scorer_cfg.get("top_n") if stats["scorer_enabled"] else None
+        stats["top_n_selected"] = 0 if stats["scorer_enabled"] else None
+        stats["top_frames_dir"] = None
+        stats["score_report_path"] = None
 
-    if stats["scorer_enabled"] and stats["final_paths"]:
-        top_n = scorer_cfg.get("top_n", 30)
-        top_n = min(top_n, len(stats["final_paths"]))  # can't select more than available
-        stats["top_n_requested"] = scorer_cfg.get("top_n", 30)
+        if stats["scorer_enabled"] and stats["final_paths"]:
+            top_n = scorer_cfg.get("top_n", 30)
+            top_n = min(top_n, len(stats["final_paths"]))  # can't select more than available
+            stats["top_n_requested"] = scorer_cfg.get("top_n", 30)
 
-        scored = score_all_frames(stats["final_paths"])
-        print_top_scores(scored, n=min(10, top_n))
+            scored = score_all_frames(stats["final_paths"])
+            print_top_scores(scored, n=min(10, top_n))
 
-        top_paths = select_top_n(scored, video_output_dir, top_n)
-        stats["top_n_selected"] = len(top_paths)
-        stats["top_frames_dir"] = os.path.join(video_output_dir, "top_frames")
+            top_paths = select_top_n(scored, video_output_dir, top_n)
+            stats["top_n_selected"] = len(top_paths)
+            stats["top_frames_dir"] = os.path.join(video_output_dir, "top_frames")
 
-        if scorer_cfg.get("save_score_report"):
-            rp = save_score_report(scored, video_output_dir)
-            stats["score_report_path"] = rp
-            print(f"[SCORE] Score report saved: {rp}")
+            if scorer_cfg.get("save_score_report"):
+                rp = save_score_report(scored, video_output_dir)
+                stats["score_report_path"] = rp
+                print(f"[SCORE] Score report saved: {rp}")
 
-    # ── Step 5: Cleanup raw ──
-    if not cfg["output"].get("keep_raw", False):
-        shutil.rmtree(raw_dir, ignore_errors=True)
+    finally:
+        # MAIN-1 FIX: always clean up _raw/ even if an exception is raised
+        # mid-pipeline (e.g. during filter or scoring). Without this, partial
+        # raw frames accumulate on disk silently on error.
+        if not cfg["output"].get("keep_raw", False):
+            shutil.rmtree(raw_dir, ignore_errors=True)
 
     # ── Step 6: Reports ──
     if cfg["output"].get("report_json", True):
@@ -376,16 +385,32 @@ def apply_cli_overrides(cfg: dict, args) -> dict:
     if args.mode:
         cfg["extraction"]["mode"] = args.mode
     if args.fps is not None:
-        cfg["extraction"]["fps"] = args.fps
+        if args.fps <= 0:
+            print(f"[ERROR] --fps must be > 0, got {args.fps}. Using default.")
+        else:
+            cfg["extraction"]["fps"] = args.fps
     if args.blur is not None:
-        cfg["filter"]["blur_threshold"] = args.blur
+        if args.blur < 0:
+            print(f"[ERROR] --blur must be >= 0, got {args.blur}. Using default.")
+        else:
+            cfg["filter"]["blur_threshold"] = args.blur
     if args.sim is not None:
-        cfg["filter"]["similarity_threshold"] = args.sim
+        # MAIN-5 FIX: validate range. --sim > 1.0 means sim >= threshold is
+        # never true, so NO frames would ever be removed as duplicates.
+        # --sim <= 0.0 means all frames would be immediately removed.
+        if not (0.0 < args.sim < 1.0):
+            print(f"[ERROR] --sim must be between 0.0 and 1.0 (exclusive), got {args.sim}. "
+                  "Using default of 0.70.")
+        else:
+            cfg["filter"]["similarity_threshold"] = args.sim
     if args.method:
         cfg["filter"]["dedup_method"] = args.method
     if args.top is not None:
-        cfg["scorer"]["enabled"] = True
-        cfg["scorer"]["top_n"] = args.top
+        if args.top <= 0:
+            print(f"[ERROR] --top must be > 0, got {args.top}. Scorer disabled.")
+        else:
+            cfg["scorer"]["enabled"] = True
+            cfg["scorer"]["top_n"] = args.top
     if args.keep_raw:
         cfg["output"]["keep_raw"] = True
     if args.no_html:

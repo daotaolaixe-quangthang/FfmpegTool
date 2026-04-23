@@ -1061,7 +1061,13 @@
   // ═══════════════════════════════════════
   async function runPipeline() {
     // Close previous SSE
-    if (eventSource) { eventSource.close(); }
+    if (eventSource) { eventSource.close(); eventSource = null; }
+
+    // FE-9 FIX: reset stale state from previous run.
+    // Without this, openFolder() / openPreview() use the previous run's stats
+    // if the new run fails before returning any stats — opening the wrong folder.
+    currentStats  = null;
+    currentJobId  = null;
 
     const payload = buildPayload();
 
@@ -1309,11 +1315,18 @@
     // FE-2 FIX: send full stats to backend and let resolve_open_folder() handle
     // path resolution server-side. This eliminates duplicated path-stripping
     // logic that previously existed in both frontend and backend.
-    await fetch('/api/open-folder', {
+    const resp = await fetch('/api/open-folder', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({stats: currentStats})
     });
+
+    // APP-6 / FE-10 FIX: handle error response — previously the return value
+    // was ignored entirely, so a 400/404 from the server was silently swallowed.
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      addLog(`[WARN] Could not open folder: ${err.error || 'Server error ' + resp.status}`, 'warn');
+    }
   }
 
   async function openPreview() {

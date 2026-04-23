@@ -7,7 +7,7 @@
     "_mode_options": ["fps", "scene"],
     "scene_threshold": 27.0,
     "jpeg_quality": 2,
-    "_jpeg_quality_note": "1=best quality, 31=worst"
+    "_jpeg_quality_note": "1=best quality/largest files, 31=worst/smallest. Value 2 = near-lossless (large temp files). Recommended: 5-8 for balanced quality/speed"
   },
 
   "filter": {
@@ -18,7 +18,8 @@
     "dedup_method": "phash",
     "_dedup_method_options": ["phash", "ssim"],
     "_dedup_method_note": "phash=fast (recommended), ssim=slower but more accurate (use for <500 frames)",
-    "phash_size": 16
+    "phash_size": 16,
+    "_phash_size_note": "pHash grid size. Higher = more precise but slower. Valid range: 8-32. At hash_size=16, hash is 256 bits and max Hamming distance is 256"
   },
 
   "scorer": {
