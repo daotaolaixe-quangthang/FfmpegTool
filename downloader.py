@@ -6,7 +6,6 @@ Logic migrated and improved from: video_frame_extractor.py (legacy)
 """
 
 import os
-import sys
 import subprocess
 from pathlib import Path
 
@@ -52,19 +51,23 @@ def download_video(url: str, output_dir: str, filename: str = "downloaded_video"
 
     result = subprocess.run(cmd, capture_output=False, text=True)
 
-    if result.returncode != 0:
-        print(f"[ERROR] yt-dlp failed. Make sure yt-dlp is installed:")
-        print(f"        pip install yt-dlp")
-        sys.exit(1)
-
+    # BUG-6 FIX: yt-dlp may return non-zero exit code even on success
+    # (e.g. --no-overwrites returns 1 if the file already exists).
+    # Check file existence FIRST before deciding to bail out.
     if not os.path.exists(output_path):
         # yt-dlp may have saved with a different name — find it
-        mp4_files = list(Path(output_dir).glob(f"{filename}*.mp4"))
+        mp4_files = sorted(Path(output_dir).glob(f"{filename}*.mp4"))
         if mp4_files:
             output_path = str(mp4_files[0])
+        elif result.returncode != 0:
+            # Only treat as failure when file is truly missing AND yt-dlp reported error
+            # SEC-3 FIX: raise instead of sys.exit so callers can catch the error
+            raise RuntimeError(
+                f"yt-dlp failed (exit code {result.returncode}). "
+                "Make sure yt-dlp is installed: pip install yt-dlp"
+            )
         else:
-            print("[ERROR] Download completed but output file not found.")
-            sys.exit(1)
+            raise RuntimeError("yt-dlp reported success but output file not found.")
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"[OK] Downloaded: {os.path.basename(output_path)} ({size_mb:.1f} MB)")

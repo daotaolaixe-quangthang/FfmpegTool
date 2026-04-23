@@ -33,6 +33,7 @@ app = Flask(__name__, template_folder=os.path.join(TOOL_DIR, "templates"))
 # ── In-memory job store ──
 # job_id -> {"queue": Queue, "status": str, "stats": dict}
 JOBS: dict[str, dict] = {}
+JOBS_LOCK = threading.Lock()  # Protect all mutations of JOBS dict
 
 
 # ─────────────────────────────────────────────
@@ -82,6 +83,32 @@ def load_result_stats(output_dir: str, video_name: str) -> dict | None:
     if os.path.exists(report_path):
         with open(report_path, "r", encoding="utf-8") as f:
             return json.load(f)
+    return None
+
+
+def load_url_result_stats(output_dir: str) -> dict | None:
+    """
+    MISSED-2 FIX: In URL mode, yt-dlp may save the file as
+    'downloaded_video.f123.mp4' (merged stream filename) instead of
+    'downloaded_video.mp4', causing the video folder stem to differ.
+    Scan the output_dir for any subfolder containing report.json,
+    preferring 'downloaded_video' but accepting any glob match.
+    """
+    output_path = Path(output_dir)
+    if not output_path.is_dir():
+        return None
+
+    # Prefer exact match first
+    exact = output_path / "downloaded_video" / "report.json"
+    if exact.exists():
+        with open(exact, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    # Fall back: find any subfolder whose name starts with 'downloaded_video'
+    for candidate in sorted(output_path.glob("downloaded_video*/report.json")):
+        with open(candidate, "r", encoding="utf-8") as f:
+            return json.load(f)
+
     return None
 
 
@@ -210,7 +237,10 @@ def load_batch_stats(output_dir: str) -> dict | None:
             videos_found += 1
             video_results.append({
                 "index":               videos_found,
-                "video_name":          r.get("video_name", sub.name),
+                # BUG-1 FIX: report.json writes key "video", NOT "video_name".
+                # Fallback chain: try "video_name" first (future-proof),
+                # then "video" (current reporter.py key), then folder name.
+                "video_name":          r.get("video_name", r.get("video", sub.name)),
                 "status":              "success",
                 "total_raw_frames":    r.get("total_raw_frames",    0),
                 "removed_blurry":      r.get("removed_blurry",      0),
@@ -289,12 +319,23 @@ def api_run():
 
     job_id = str(uuid.uuid4())[:8]
     q: queue.Queue = queue.Queue()
-    JOBS[job_id] = {"queue": q, "status": "running", "stats": None}
-
     cmd = build_command(data)
 
+    # ── BUG-3 + SEC-2 FIX: cleanup BEFORE creating new job, under lock ──
+    # Prevents deleting a job that was just created (or is still being streamed).
+    # All JOBS mutations are protected by JOBS_LOCK for thread-safety.
+    with JOBS_LOCK:
+        # Keep JOBS dict from growing unboundedly (keep last 20 jobs)
+        if len(JOBS) >= 20:
+            oldest_key = next(iter(JOBS))
+            del JOBS[oldest_key]
+        JOBS[job_id] = {"queue": q, "status": "running", "stats": None}
+
     def run_pipeline():
-        JOBS[job_id]["cmd"] = " ".join(cmd)
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job:
+                job["cmd"] = " ".join(cmd)  # mutate inside lock for consistency
         try:
             env = {
                 **os.environ,
@@ -343,24 +384,24 @@ def api_run():
         if is_batch:
             stats = load_batch_stats(output_dir)
         elif data.get("url", "").strip():
-            # URL mode saves file as 'downloaded_video.mp4'
-            stats = load_result_stats(output_dir, "downloaded_video")
+            # URL mode: downloader saves as 'downloaded_video.{ext}' but may
+            # fall back to a glob-matched filename. Scan actual files to find
+            # the right report folder (MISSED-2 fix).
+            stats = load_url_result_stats(output_dir)
         else:
             video_name = Path(data.get("input", "video")).stem
             stats = load_result_stats(output_dir, video_name)
 
-        JOBS[job_id]["stats"] = stats
-        JOBS[job_id]["status"] = "done" if exit_code == 0 else "error"
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job:
+                job["stats"] = stats
+                job["status"] = "done" if exit_code == 0 else "error"
 
         q.put(("done", str(exit_code)))
 
     thread = threading.Thread(target=run_pipeline, daemon=True)
     thread.start()
-
-    # Keep JOBS dict from growing unboundedly (keep last 20 jobs)
-    if len(JOBS) > 20:
-        oldest_key = next(iter(JOBS))
-        del JOBS[oldest_key]
 
     return jsonify({"job_id": job_id, "command": " ".join(cmd)})
 
@@ -368,7 +409,8 @@ def api_run():
 @app.route("/api/stream/<job_id>")
 def api_stream(job_id: str):
     """Server-Sent Events stream for real-time log output."""
-    job = JOBS.get(job_id)
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
     if not job:
         return "Job not found", 404
 
@@ -383,7 +425,11 @@ def api_stream(job_id: str):
                     safe = msg.replace("\n", " ").replace("\r", "")
                     yield f"data: {json.dumps({'type': 'log', 'text': safe})}\n\n"
                 elif msg_type == "done":
-                    stats = JOBS[job_id].get("stats")
+                    # BUG-3 FIX: use .get() instead of direct index to avoid
+                    # KeyError if the job was evicted from JOBS during streaming.
+                    with JOBS_LOCK:
+                        finished_job = JOBS.get(job_id, {})
+                    stats = finished_job.get("stats")
                     yield f"data: {json.dumps({'type': 'done', 'exit_code': msg, 'stats': stats})}\n\n"
                     break
             except queue.Empty:
@@ -402,7 +448,8 @@ def api_stream(job_id: str):
 
 @app.route("/api/job/<job_id>")
 def api_job_status(job_id: str):
-    job = JOBS.get(job_id)
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
     if not job:
         return jsonify({"error": "Not found"}), 404
     return jsonify({"status": job["status"], "stats": job.get("stats")})
@@ -410,11 +457,25 @@ def api_job_status(job_id: str):
 
 @app.route("/api/open-folder", methods=["POST"])
 def api_open_folder():
-    """Open a folder in Windows Explorer."""
+    """
+    Open a folder in Windows Explorer.
+
+    FE-2 FIX: Accepts either a raw 'folder' path OR full job stats dict.
+    When 'stats' is provided, resolves the correct folder server-side via
+    resolve_open_folder() so the frontend doesn't need to strip path suffixes.
+    This eliminates the duplicated path-resolution logic that existed in both
+    the frontend (openFolder()) and the backend (resolve_open_folder()).
+    """
     data = request.get_json()
     if not data:
         return jsonify({"error": "No data"}), 400
-    folder = data.get("folder", "")
+
+    # If caller sends full stats dict, resolve the folder server-side.
+    if "stats" in data:
+        folder = resolve_open_folder(data["stats"])
+    else:
+        folder = data.get("folder", "")
+
     if not folder:
         return jsonify({"error": "No folder specified"}), 400
     if os.path.isdir(folder):
@@ -426,7 +487,8 @@ def api_open_folder():
 @app.route("/api/preview/<job_id>")
 def api_preview(job_id: str):
     """Return HTML preview path for the job."""
-    job = JOBS.get(job_id)
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
     if not job or not job.get("stats"):
         return jsonify({"error": "No stats"}), 404
     stats = job["stats"]
@@ -443,7 +505,8 @@ def api_serve_preview(job_id: str):
     This avoids browser security restrictions on file:// URLs.
     The frontend opens /api/serve-preview/<job_id> in a new tab.
     """
-    job = JOBS.get(job_id)
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
     if not job or not job.get("stats"):
         return "Job not found or no stats available.", 404
 
@@ -481,7 +544,8 @@ def api_serve_preview(job_id: str):
 @app.route("/api/serve-preview-assets/<job_id>/<path:asset_path>")
 def api_serve_preview_asset(job_id: str, asset_path: str):
     """Serve assets referenced by preview HTML when opened through Flask."""
-    job = JOBS.get(job_id)
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
     if not job or not job.get("stats"):
         return "Job not found or no stats available.", 404
 

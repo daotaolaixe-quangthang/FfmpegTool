@@ -18,13 +18,12 @@ def extract_by_fps(video_path: str, raw_dir: str, fps: float, jpeg_quality: int)
     output_pattern = os.path.join(raw_dir, "frame_%05d.jpg")
 
     cmd = [
-        "ffmpeg",
+        "ffmpeg", "-y",           # -y (overwrite) MUST be a global option before -i
         "-i", video_path,
         "-vf", f"fps={fps}",
         "-q:v", str(jpeg_quality),
+        "-loglevel", "warning",
         output_pattern,
-        "-y",
-        "-loglevel", "warning"
     ]
 
     result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
@@ -67,14 +66,13 @@ def extract_by_scene(video_path: str, raw_dir: str, threshold: float, jpeg_quali
         output_path = os.path.join(raw_dir, f"frame_{i:05d}.jpg")
 
         cmd = [
-            "ffmpeg",
+            "ffmpeg", "-y",       # -y (overwrite) MUST be a global option before -ss/-i
             "-ss", f"{mid_sec:.3f}",
             "-i", video_path,
             "-vframes", "1",
             "-q:v", str(jpeg_quality),
+            "-loglevel", "quiet",
             output_path,
-            "-y",
-            "-loglevel", "quiet"
         ]
         result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
         if result.returncode == 0 and os.path.exists(output_path):

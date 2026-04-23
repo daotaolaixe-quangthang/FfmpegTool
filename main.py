@@ -467,7 +467,11 @@ def main():
     # ── Determine video path ──
     if args.url:
         os.makedirs(args.output, exist_ok=True)
-        video_path = download_video(args.url, args.output, filename="downloaded_video")
+        try:
+            video_path = download_video(args.url, args.output, filename="downloaded_video")
+        except RuntimeError as e:
+            print(f"[ERROR] Download failed: {e}")
+            sys.exit(1)
         process_video(video_path, args.output, cfg)
 
     elif args.batch:

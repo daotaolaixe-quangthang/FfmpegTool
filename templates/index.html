@@ -1044,9 +1044,13 @@
 
   function classifyLog(line) {
     if (line.includes('[OK]') || line.includes('DONE') || line.includes('HOAN')) return 'ok';
-    if (line.includes('[ERROR]') || line.includes('Error') || line.includes('error')) return 'err';
+    // FE-3 FIX: use word-boundary regex \b to avoid false positives on filenames
+    // that happen to contain 'error' as a substring (e.g. 'error_frame.jpg').
+    if (line.includes('[ERROR]') || /\bError\b/.test(line) || /\berror\b/.test(line)) return 'err';
     if (line.includes('[EXTRACT]') || line.includes('[DEDUP]') || line.includes('[REPORT]')) return 'info';
-    if (line.includes('[SCORE]') || line.includes('score') || line.includes('Total')) return 'score';
+    // FE-3 FIX: removed line.includes('Total') — it caused false purple highlights
+    // on any log line containing the word 'Total' (e.g. '[BATCH] Done. Total: 5').
+    if (line.includes('[SCORE]') || line.includes('[DEDUP-SSIM]')) return 'score';
     if (line.includes('[BLUR]') || line.includes('[WARN]') || line.includes('WARN')) return 'warn';
     if (line.match(/^[=─]+$/) || line.includes('===')) return 'sep';
     return '';
@@ -1134,6 +1138,11 @@
         if (success && msg.stats) {
           currentStats = msg.stats;
           showResults(msg.stats);
+        } else if (success && !msg.stats) {
+          // FE-1 FIX: pipeline succeeded but no stats (e.g. --no-report flag used).
+          // Show a warning so user knows results panel won't populate.
+          addLog('[WARN] Pipeline completed but no report data found. Results panel will not update.', 'warn');
+          addLog('[WARN] Make sure "Skip HTML Preview Generation" is OFF, or add --no-report flag and check output folder manually.', 'warn');
         }
 
       } else if (msg.type === 'ping') {
@@ -1142,7 +1151,14 @@
     };
 
     eventSource.onerror = () => {
-      addLog('[ERROR] Lost connection to server.', 'err');
+      // FE-4 FIX: explicitly close EventSource to prevent automatic reconnect
+      // loop. Without this, browser keeps retrying, causing log spam and
+      // preventing the run button from being re-enabled properly.
+      eventSource.close();
+      eventSource = null;
+      dot.className = 'status-dot red';
+      document.getElementById('status-text').textContent = 'Connection lost.';
+      addLog('[ERROR] Lost connection to server. Please check if the app is still running.', 'err');
       document.getElementById('btn-run').disabled = false;
     };
   }
@@ -1290,14 +1306,13 @@
   async function openFolder() {
     if (!currentStats) return;
 
-    const folder = currentStats.is_batch
-      ? (currentStats.output_folder || '')
-      : (currentStats.output_folder ? currentStats.output_folder.replace(/[\\\/]?unique_frames$/, '').replace(/[\\\/]+$/, '') : '');
-
+    // FE-2 FIX: send full stats to backend and let resolve_open_folder() handle
+    // path resolution server-side. This eliminates duplicated path-stripping
+    // logic that previously existed in both frontend and backend.
     await fetch('/api/open-folder', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({folder: folder})
+      body: JSON.stringify({stats: currentStats})
     });
   }
 
