@@ -365,6 +365,53 @@ class TestParallelBatchAPI(unittest.TestCase):
                                 content_type="text/plain")
         self.assertIn(resp.status_code, [400, 415])
 
+    def test_parallel_run_writes_batch_summary_with_non_success_statuses(self):
+        """Background parallel batch run must persist skipped/error statuses to summary."""
+        import app as flask_app
+        for n in ["a.mp4", "b.mp4"]:
+            Path(os.path.join(self._tmpdir, n)).write_bytes(b"FAKE")
+
+        results = [
+            {
+                "video": os.path.join(self._tmpdir, "a.mp4"),
+                "video_name": "a.mp4",
+                "stats": {"total_raw": 5, "removed_blur": 1, "removed_duplicate": 1,
+                          "final_count": 3, "top_n_selected": None,
+                          "output_dir": os.path.join(self._tmpdir, "a", "unique_frames")},
+                "status": "success",
+                "error": None,
+            },
+            {
+                "video": os.path.join(self._tmpdir, "b.mp4"),
+                "video_name": "b.mp4",
+                "stats": None,
+                "status": "error",
+                "error": "boom",
+            },
+        ]
+
+        with patch("parallel_runner.run_parallel_batch", return_value=results):
+            with patch("probe_first.scan_batch", return_value=([os.path.join(self._tmpdir, "a.mp4"), os.path.join(self._tmpdir, "b.mp4")], [])):
+                with patch("hw_detect.resolve_encoder", return_value="cpu"):
+                    with patch("hw_detect.get_ffmpeg_hwaccel_args", return_value=[]):
+                        resp = self.client.post(
+                            "/api/batch/run",
+                            json={"input": self._tmpdir, "output": self._tmpdir, "workers": 2, "parallel": True},
+                        )
+                        self.assertEqual(resp.status_code, 200)
+                        time.sleep(0.3)
+
+        summary_path = os.path.join(self._tmpdir, "_batch_summary.json")
+        self.assertTrue(os.path.isfile(summary_path))
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+        self.assertEqual(summary["success"], 1)
+        self.assertEqual(summary["error"], 1)
+        self.assertEqual(summary["failed"], 1)
+        statuses = {item["video_name"]: item["status"] for item in summary["video_results"]}
+        self.assertEqual(statuses["a.mp4"], "success")
+        self.assertEqual(statuses["b.mp4"], "error")
+
 
 # =================================================================
 # 3. DAG RUNNER UNIT TESTS
@@ -1010,6 +1057,148 @@ class TestDagSpecFileIO(unittest.TestCase):
         }
         result = validate_dag_spec(spec)
         self.assertIsNone(result["output"])
+
+
+# =================================================================
+# Phase 4 regression: DAG bug fixes
+# =================================================================
+
+class TestDagBranchOutputIsolation(unittest.TestCase):
+    """Duplicate preset branches must not share the same output directory."""
+
+    def test_duplicate_preset_branches_get_distinct_output_dirs(self):
+        """Two branches with the same preset must produce different effective_out paths."""
+        from dag_runner import run_dag, validate_dag_spec
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "clip.mp4")
+            Path(src).write_bytes(b"FAKE")
+            spec = validate_dag_spec({
+                "source": src,
+                "output": d,
+                "branches": [
+                    {"preset": "tiktok_pack"},
+                    {"preset": "tiktok_pack"},
+                ],
+            })
+            captured_outputs = []
+
+            def fake_process_video(path, out, cfg, batch_index=0):
+                captured_outputs.append(out)
+                return {"final_count": 1, "output_dir": out}
+
+            with patch("main.process_video", side_effect=fake_process_video):
+                with patch("preset_loader.apply_preset", return_value={}):
+                    from dag_runner import _run_dag_sequential
+                    branch_video_map = []
+                    branch_results = []
+                    for i, branch in enumerate(spec["branches"]):
+                        effective_out = os.path.join(d, f"_dag_{i}_{branch['preset']}")
+                        branch_video_map.append((i, src, effective_out, branch["preset"], {}))
+                        branch_results.append({"preset": branch["preset"], "output": effective_out,
+                                               "status": "pending", "stats": None, "error": None})
+                    _run_dag_sequential(branch_video_map, branch_results)
+
+            self.assertEqual(len(captured_outputs), 2)
+            self.assertNotEqual(captured_outputs[0], captured_outputs[1],
+                                "Duplicate preset branches must use distinct output dirs")
+            for out in captured_outputs:
+                self.assertIn("tiktok_pack", out)
+
+
+class TestDagAPIHwaccelParity(unittest.TestCase):
+    """POST /api/dag/run must inject hardware resolution identical to CLI."""
+
+    def setUp(self):
+        import app as flask_app
+        flask_app.app.config["TESTING"] = True
+        self.client = flask_app.app.test_client()
+        self._app_module = flask_app
+        self._tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_dag_api_injects_resolved_key_and_hwaccel_args(self):
+        """DAG API must set _resolved_key and _hwaccel_args on cfg before run_dag."""
+        src = os.path.join(self._tmpdir, "clip.mp4")
+        Path(src).write_bytes(b"FAKE")
+
+        base_cfg = {
+            "extraction": {"mode": "fps", "fps": 5, "jpeg_quality": 2},
+            "filter": {}, "scorer": {}, "output": {},
+            "hardware": {"encoder": "auto", "enable_hwaccel": True},
+            "batch": {"probe_before_run": False},
+            "normalize": {"enabled": False},
+        }
+
+        captured = {}
+
+        def fake_run_dag(spec, cfg, default_output="", workers=1):
+            captured["hardware"] = cfg.get("hardware", {})
+            captured["hwaccel_args"] = cfg.get("extraction", {}).get("_hwaccel_args")
+            return {"source": src, "branches": [], "success": 0, "skipped": 0, "failed": 0}
+
+        with patch("dag_runner.run_dag", side_effect=fake_run_dag):
+            with patch("main.apply_defaults", return_value=base_cfg):
+                with patch("main.load_config", return_value={}):
+                    with patch("hw_detect.resolve_encoder", return_value="qsv") as mock_resolve:
+                        with patch("hw_detect.get_ffmpeg_hwaccel_args",
+                                   return_value=["-hwaccel", "qsv"]) as mock_hwargs:
+                            resp = self.client.post(
+                                "/api/dag/run",
+                                json={
+                                    "source": src,
+                                    "output": self._tmpdir,
+                                    "branches": [{"preset": "tiktok_pack"}],
+                                },
+                            )
+
+        self.assertEqual(resp.status_code, 200)
+        mock_resolve.assert_called_once()
+        mock_hwargs.assert_called_once_with("qsv")
+        self.assertEqual(captured["hardware"].get("_resolved_key"), "qsv")
+        self.assertEqual(captured["hwaccel_args"], ["-hwaccel", "qsv"])
+
+    def test_dag_api_skips_hwaccel_when_disabled(self):
+        """DAG API must force cpu/_resolved_key=cpu when enable_hwaccel=False."""
+        src = os.path.join(self._tmpdir, "clip.mp4")
+        Path(src).write_bytes(b"FAKE")
+
+        base_cfg = {
+            "extraction": {"mode": "fps", "fps": 5, "jpeg_quality": 2},
+            "filter": {}, "scorer": {}, "output": {},
+            "hardware": {"encoder": "auto", "enable_hwaccel": False},
+            "batch": {"probe_before_run": False},
+            "normalize": {"enabled": False},
+        }
+
+        captured = {}
+
+        def fake_run_dag(spec, cfg, default_output="", workers=1):
+            captured["hardware"] = cfg.get("hardware", {})
+            captured["hwaccel_args"] = cfg.get("extraction", {}).get("_hwaccel_args")
+            return {"source": src, "branches": [], "success": 0, "skipped": 0, "failed": 0}
+
+        with patch("dag_runner.run_dag", side_effect=fake_run_dag):
+            with patch("main.apply_defaults", return_value=base_cfg):
+                with patch("main.load_config", return_value={}):
+                    with patch("hw_detect.resolve_encoder") as mock_resolve:
+                        with patch("hw_detect.get_ffmpeg_hwaccel_args") as mock_hwargs:
+                            resp = self.client.post(
+                                "/api/dag/run",
+                                json={
+                                    "source": src,
+                                    "output": self._tmpdir,
+                                    "branches": [{"preset": "tiktok_pack"}],
+                                },
+                            )
+
+        self.assertEqual(resp.status_code, 200)
+        mock_resolve.assert_not_called()
+        mock_hwargs.assert_not_called()
+        self.assertEqual(captured["hardware"].get("_resolved_key"), "cpu")
+        self.assertEqual(captured["hwaccel_args"], [])
 
 
 if __name__ == "__main__":

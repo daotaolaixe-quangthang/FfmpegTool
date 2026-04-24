@@ -95,7 +95,7 @@ _PATTERNS: list[tuple[str, ErrorCategory, str, Optional[str]]] = [
     (
         r"Invalid data found|moov atom not found|"
         r"error while decoding|Invalid stream|"
-        r"Truncated file|End of file|corrupt",
+        r"Truncated file|End of file|corrupt(?:ed)?\s+(?:file|data|stream|packet|header)",
         ErrorCategory.FILE_CORRUPT,
         "The input file appears to be corrupt or incomplete.",
         "Re-download the file or verify it plays correctly in a media player.",

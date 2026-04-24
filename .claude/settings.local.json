@@ -36,7 +36,14 @@
       "Bash(py -0p)",
       "Bash(python -m pip install --dry-run faster-whisper)",
       "Bash(python -m pip install --dry-run ctranslate2)",
-      "Bash(python -m pip install faster-whisper)"
+      "Bash(python -m pip install faster-whisper)",
+      "Bash(mkdir -p __TRACKED_VAR__/.claude/skills)",
+      "Bash(git clone *)",
+      "Bash(python -m pytest tests/test_phase3.py -q)",
+      "Bash(python -m pytest tests/test_phase4.py::TestParallelBatchAPI::test_parallel_run_writes_batch_summary_with_non_success_statuses -s)",
+      "Bash(python -m pytest tests/test_phase4.py -q)",
+      "Bash(python -m pytest \"e:/FfmpegTool/tests/test_phase2.py\" -q)",
+      "Bash(pytest -q \"E:/FfmpegTool/tests/test_senior_audit.py\")"
     ],
     "deny": [],
     "defaultMode": "bypassPermissions",

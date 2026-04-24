@@ -148,16 +148,16 @@ def run_dag(
 
     # Build branch result list
     branch_results = []
-    branch_video_map = []  # (video_path, output_dir, preset, branch_cfg)
+    branch_video_map = []  # (result_idx, video_path, output_dir, preset, branch_cfg)
 
     for i, branch in enumerate(branches):
         preset     = branch.get("preset", "").strip()
         branch_out = (branch.get("output") or "").strip() or spec_output or ""
 
-        # Each branch gets a sub-directory matching the preset name
+        # Each branch gets a sub-directory indexed by position + preset name
+        # to avoid output collision when the same preset appears multiple times.
         if branch_out:
-            # Suffix output with preset name to avoid collision
-            effective_out = os.path.join(branch_out, f"_dag_{preset}")
+            effective_out = os.path.join(branch_out, f"_dag_{i}_{preset}")
         else:
             raise ValueError(
                 f"DAG branch[{i}] (preset={preset}): no output directory specified. "
@@ -166,6 +166,7 @@ def run_dag(
 
         # Deep-copy + apply preset
         branch_cfg = copy.deepcopy(cfg)
+        result_idx = len(branch_results)  # capture index BEFORE appending
         try:
             from preset_loader import apply_preset  # noqa: PLC0415
             branch_cfg = apply_preset(branch_cfg, preset)
@@ -179,7 +180,7 @@ def run_dag(
             })
             continue
 
-        branch_video_map.append((source, effective_out, preset, branch_cfg))
+        branch_video_map.append((result_idx, source, effective_out, preset, branch_cfg))
         branch_results.append({
             "preset":  preset,
             "output":  effective_out,
@@ -214,11 +215,10 @@ def _run_dag_sequential(branch_video_map: list, branch_results: list):
     """Execute DAG branches sequentially, in-place update branch_results."""
     from main import process_video  # noqa: PLC0415
 
-    result_idx = 0
-    for source, effective_out, preset, branch_cfg in branch_video_map:
+    for branch_num, (result_idx, source, effective_out, preset, branch_cfg) in enumerate(branch_video_map, 1):
         print(f"\n[DAG] Branch '{preset}' -> {effective_out}")
         try:
-            stats = process_video(source, effective_out, branch_cfg, batch_index=0)
+            stats = process_video(source, effective_out, branch_cfg, batch_index=branch_num)
             if stats:
                 branch_results[result_idx]["status"] = "success"
                 branch_results[result_idx]["stats"]  = stats
@@ -229,7 +229,6 @@ def _run_dag_sequential(branch_video_map: list, branch_results: list):
             branch_results[result_idx]["status"] = "error"
             branch_results[result_idx]["error"]  = str(exc)
             print(f"[DAG] Branch '{preset}' failed: {exc}")
-        result_idx += 1
 
 
 def _run_dag_parallel(branch_video_map: list, branch_results: list, workers: int):
@@ -240,12 +239,10 @@ def _run_dag_parallel(branch_video_map: list, branch_results: list, workers: int
     effective_workers = resolve_max_workers(workers)
     futures_idx = {}   # future -> index in branch_results
 
-    result_idx = 0
     with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-        for source, effective_out, preset, branch_cfg in branch_video_map:
-            future = executor.submit(_worker, source, effective_out, branch_cfg, 0)
+        for branch_num, (result_idx, source, effective_out, preset, branch_cfg) in enumerate(branch_video_map, 1):
+            future = executor.submit(_worker, source, effective_out, branch_cfg, branch_num)
             futures_idx[future] = (result_idx, preset)
-            result_idx += 1
 
         for future in as_completed(futures_idx):
             idx, preset = futures_idx[future]

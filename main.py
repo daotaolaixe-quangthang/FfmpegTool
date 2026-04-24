@@ -178,6 +178,92 @@ def resolve_video_output_name(
     return result or video_name
 
 
+def materialize_cached_frames(cached_frames: list[str], unique_dir: str) -> list[str]:
+    """Copy cached frames into the current run's unique_frames folder."""
+    os.makedirs(unique_dir, exist_ok=True)
+    materialized = []
+    for src in sorted(cached_frames):
+        dst = os.path.join(unique_dir, os.path.basename(src))
+        shutil.copy2(src, dst)
+        materialized.append(dst)
+    return materialized
+
+
+def build_batch_result_entry(index: int | None, video_name: str, status: str,
+                             stats: dict | None = None, error: str | None = None) -> dict:
+    """Normalize per-video batch results for summary JSON and app loading."""
+    stats = stats or {}
+    return {
+        "index":               index,
+        "video_name":          video_name,
+        "status":              status,
+        "total_raw_frames":    stats.get("total_raw", 0),
+        "removed_blurry":      stats.get("removed_blur", 0),
+        "removed_duplicate":   stats.get("removed_duplicate", 0),
+        "final_unique_frames": stats.get("final_count", 0),
+        "top_n_selected":      stats.get("top_n_selected"),
+        "output_folder":       stats.get("output_dir", ""),
+        "error":               error,
+    }
+
+
+def write_batch_summary(output_dir: str, input_folder: str, total_videos: int,
+                        preflight_skipped: list[dict], video_results: list[dict]) -> str:
+    """Write the canonical batch summary JSON consumed by the app."""
+    all_results = preflight_skipped + video_results
+    success_count = sum(1 for r in video_results if r["status"] == "success")
+    skipped_count = sum(1 for r in all_results if r["status"] == "skipped")
+    error_count = sum(1 for r in all_results if r["status"] == "error")
+
+    print(f"\n[BATCH] Done. Success: {success_count} | Skipped: {skipped_count} | Errors: {error_count}")
+    non_success_names = [v["video_name"] for v in all_results if v["status"] != "success"]
+    if non_success_names:
+        print(f"[BATCH] Non-success files: {', '.join(non_success_names)}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    summary = {
+        "total_videos":      total_videos,
+        "success":           success_count,
+        "skipped":           skipped_count,
+        "error":             error_count,
+        "failed":            skipped_count + error_count,
+        "input_folder":      input_folder,
+        "output_folder":     output_dir,
+        "generated_at":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "video_results":     all_results,
+    }
+    summary_path = os.path.join(output_dir, "_batch_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"[BATCH_SUMMARY] {summary_path}")
+
+    if success_count > 0:
+        html_path = save_batch_html_preview(output_dir)
+        if html_path:
+            print(f"[BATCH] Master preview: {html_path}")
+
+    return summary_path
+
+
+def write_url_result_marker(output_dir: str, stats: dict | None):
+    """Persist the most recent URL-run report location for the web app."""
+    marker_path = os.path.join(output_dir, "_last_url_result.json")
+    if not stats or not stats.get("output_dir"):
+        if os.path.exists(marker_path):
+            os.remove(marker_path)
+        return
+
+    video_dir = os.path.dirname(stats["output_dir"])
+    report_path = os.path.join(video_dir, "report.json")
+    payload = {
+        "report_path": report_path,
+        "output_folder": stats.get("output_dir", ""),
+        "written_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(marker_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
 # ─────────────────────────────────────────────
 # Single video pipeline
 # ─────────────────────────────────────────────
@@ -201,6 +287,14 @@ def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int 
 
     for transient_dir in (raw_dir, unique_dir, top_frames_dir):
         shutil.rmtree(transient_dir, ignore_errors=True)
+
+    # Write an in-progress marker so --clean-empty skips active output dirs.
+    os.makedirs(video_output_dir, exist_ok=True)
+    _processing_marker = os.path.join(video_output_dir, "_processing")
+    try:
+        open(_processing_marker, "w").close()
+    except OSError:
+        _processing_marker = None  # non-fatal; --clean-empty will be conservative
 
     sep = "=" * 58
     print(f"\n{sep}")
@@ -234,24 +328,27 @@ def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int 
         cached_frames = _cache_mgr.get_cached_frames(original_video_path, cfg)
         if cached_frames:
             print(f"[CACHE] Cache hit -- skipping extraction for {video_name}")
-            # Build minimal stats from cached frames and write reports
-            os.makedirs(video_output_dir, exist_ok=True)
+            final_paths = materialize_cached_frames(cached_frames, unique_dir)
             stats = {
-                "total_raw":          len(cached_frames),
-                "removed_blur":       0,
-                "removed_duplicate":  0,
-                "final_count":        len(cached_frames),
-                "final_paths":        cached_frames,
-                "output_dir":         unique_dir,
-                "blur_threshold":     cfg["filter"].get("blur_threshold"),
+                "total_raw":            len(final_paths),
+                "after_blur_filter":    len(final_paths),
+                "after_dedup_filter":   len(final_paths),
+                "removed_blur":         0,
+                "removed_duplicate":    0,
+                "final_count":          len(final_paths),
+                "final_paths":          final_paths,
+                "output_dir":           unique_dir,
+                "blur_threshold":       cfg["filter"].get("blur_threshold"),
                 "similarity_threshold": cfg["filter"].get("similarity_threshold"),
-                "dedup_method":       cfg["filter"].get("dedup_method", "phash"),
-                "scorer_enabled":     False,
-                "top_n_requested":    None,
-                "top_n_selected":     None,
-                "top_frames_dir":     None,
-                "score_report_path": None,
-                "cache_hit":          True,
+                "dedup_method":         cfg["filter"].get("dedup_method", "phash"),
+                "scorer_enabled":       False,
+                "top_n_requested":      None,
+                "top_n_selected":       None,
+                "top_frames_dir":       None,
+                "score_report_path":    None,
+                "cache_hit":            True,
+                "blur_removed_list":    [],
+                "dup_removed_list":     [],
             }
             if cfg["output"].get("report_json", True):
                 rpath = save_json_report(stats, video_output_dir, video_name)
@@ -271,7 +368,7 @@ def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int 
     raw_frames = extract_frames(video_path, raw_dir, cfg["extraction"])
 
     if not raw_frames:
-        print("[WARN] No frames extracted — skipping this video (no output folder created).")
+        print("[WARN] No frames extracted - skipping this video (no output folder created).")
         return {}
 
     # Create output dir only AFTER confirming we have frames to process
@@ -313,11 +410,17 @@ def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int 
         # MAIN-1 FIX: always clean up _raw/ even if an exception is raised
         # mid-pipeline (e.g. during filter or scoring). Without this, partial
         # raw frames accumulate on disk silently on error.
-        if not cfg["output"].get("keep_raw", False):
+        if not cfg.get("output", {}).get("keep_raw", False):
             shutil.rmtree(raw_dir, ignore_errors=True)
         # Phase 2: clean up normalized temp file after pipeline completes
         if norm_result and norm_result.was_transcoded:
             norm_result.cleanup()
+        # Remove in-progress marker now that the pipeline has finished.
+        if _processing_marker:
+            try:
+                os.remove(_processing_marker)
+            except OSError:
+                pass
 
     # ── Step 0.5b (Phase 3): Store frames in cache after successful extraction ──
     if _cache_mgr is not None and stats.get("final_paths"):
@@ -384,7 +487,6 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
 
     # ── Per-video result tracking ──
     video_results: list[dict] = []
-    success_count, skipped_count, error_count = 0, 0, 0
 
     for i, video_path in enumerate(video_files, 1):
         fname = os.path.basename(video_path)
@@ -392,83 +494,20 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
         try:
             stats = process_video(video_path, output_dir, cfg, batch_index=i)
             if stats:  # process_video returns {} on 0 frames
-                success_count += 1
-                video_results.append({
-                    "index":               i,
-                    "video_name":          fname,
-                    "status":              "success",
-                    "total_raw_frames":    stats.get("total_raw",        0),
-                    "removed_blurry":      stats.get("removed_blur",     0),
-                    "removed_duplicate":   stats.get("removed_duplicate",0),
-                    "final_unique_frames": stats.get("final_count",      0),
-                    "top_n_selected":      stats.get("top_n_selected"),
-                    "output_folder":       stats.get("output_dir",       ""),
-                    "error":               None,
-                })
+                video_results.append(build_batch_result_entry(i, fname, "success", stats=stats))
             else:
-                skipped_count += 1
-                video_results.append({
-                    "index":               i,
-                    "video_name":          fname,
-                    "status":              "skipped",
-                    "total_raw_frames":    0,
-                    "removed_blurry":      0,
-                    "removed_duplicate":   0,
-                    "final_unique_frames": 0,
-                    "top_n_selected":      None,
-                    "output_folder":       "",
-                    "error":               "No frames extracted (video may be too short or unreadable)",
-                })
+                video_results.append(build_batch_result_entry(
+                    i,
+                    fname,
+                    "skipped",
+                    error="No frames extracted (video may be too short or unreadable)",
+                ))
         except Exception as e:
-            error_count += 1
             error_msg = str(e)
             print(f"[ERROR] Failed on {fname}: {error_msg}")
-            video_results.append({
-                "index":               i,
-                "video_name":          fname,
-                "status":              "error",
-                "total_raw_frames":    0,
-                "removed_blurry":      0,
-                "removed_duplicate":   0,
-                "final_unique_frames": 0,
-                "top_n_selected":      None,
-                "output_folder":       "",
-                "error":               error_msg,
-            })
+            video_results.append(build_batch_result_entry(i, fname, "error", error=error_msg))
 
-    # Merge preflight-skipped entries into video_results for reporting
-    all_results = preflight_skipped + video_results
-    skipped_count += len(preflight_skipped)
-
-    print(f"\n[BATCH] Done. Success: {success_count} | Skipped: {skipped_count} | Errors: {error_count}")
-    non_success_names = [v["video_name"] for v in all_results if v["status"] != "success"]
-    if non_success_names:
-        print(f"[BATCH] Non-success files: {', '.join(non_success_names)}")
-
-    # ── Save _batch_summary.json for app.py to read ──
-    os.makedirs(output_dir, exist_ok=True)
-    summary = {
-        "total_videos":      total,
-        "success":           success_count,
-        "skipped":           skipped_count,
-        "error":             error_count,
-        "failed":            skipped_count + error_count,
-        "input_folder":      input_folder,
-        "output_folder":     output_dir,
-        "generated_at":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "video_results":     all_results,
-    }
-    summary_path = os.path.join(output_dir, "_batch_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-    # Print structured marker so app.py can locate the file
-    print(f"[BATCH_SUMMARY] {summary_path}")
-
-    # ── Generate consolidated master HTML for all processed videos ──
-    if success_count > 0:
-        html_path = save_batch_html_preview(output_dir)
-        if html_path:
-            print(f"[BATCH] Master preview: {html_path}")
+    write_batch_summary(output_dir, input_folder, total, preflight_skipped, video_results)
 
 
 # ─────────────────────────────────────────────
@@ -753,15 +792,28 @@ def main():
             print(f"[ERROR] --clean-empty requires a valid --output folder.")
             sys.exit(1)
         removed_count = 0
+        skipped_count = 0
         for sub in sorted(Path(args.output).iterdir()):
             if not sub.is_dir():
                 continue
+            # Skip folders with an active in-progress marker (pipeline is running).
+            if (sub / "_processing").exists():
+                print(f"[CLEAN] Skipped (in-progress): {sub.name}")
+                skipped_count += 1
+                continue
             unique_dir = sub / "unique_frames"
-            if not unique_dir.exists() or not any(unique_dir.iterdir()):
-                shutil.rmtree(sub)
-                print(f"[CLEAN] Removed empty folder: {sub.name}")
-                removed_count += 1
-        print(f"[CLEAN] Done -- removed {removed_count} empty folder(s).")
+            # Recheck existence inside try/except to reduce TOCTOU window.
+            try:
+                empty = not unique_dir.exists() or not any(unique_dir.iterdir())
+                if empty:
+                    shutil.rmtree(sub)
+                    print(f"[CLEAN] Removed empty folder: {sub.name}")
+                    removed_count += 1
+            except (OSError, StopIteration):
+                # Folder modified concurrently -- leave it alone.
+                print(f"[CLEAN] Skipped (concurrent write): {sub.name}")
+                skipped_count += 1
+        print(f"[CLEAN] Done -- removed {removed_count} empty folder(s), skipped {skipped_count}.")
         sys.exit(0)
 
     # ── Phase 2: Queue add ──
@@ -860,7 +912,8 @@ def main():
         except RuntimeError as e:
             print(f"[ERROR] Download failed: {e}")
             sys.exit(1)
-        process_video(video_path, args.output, cfg)
+        stats = process_video(video_path, args.output, cfg)
+        write_url_result_marker(args.output, stats)
 
     elif args.batch:
         if not os.path.isdir(args.batch):
@@ -876,9 +929,30 @@ def main():
                 str(f) for f in _Path(args.batch).iterdir()
                 if f.is_file() and f.suffix.lower() in _video_exts
             ])
+            preflight_skipped = []
+            if cfg.get("batch", {}).get("probe_before_run", True):
+                original_files = list(video_files)
+                video_files, bad_results = scan_batch(video_files)
+                for bad in bad_results:
+                    preflight_skipped.append(build_batch_result_entry(
+                        None,
+                        Path(bad.path).name,
+                        "skipped",
+                        error=" | ".join(bad.issues),
+                    ))
             eff_workers = resolve_max_workers(n_workers)
             print(f"[BATCH] Parallel mode: {eff_workers} workers")
-            run_parallel_batch(video_files, args.output, cfg, workers=n_workers)
+            results = run_parallel_batch(video_files, args.output, cfg, workers=n_workers)
+            video_results = []
+            for i, result in enumerate(results, 1):
+                video_results.append(build_batch_result_entry(
+                    i,
+                    result["video_name"],
+                    result["status"],
+                    stats=result.get("stats"),
+                    error=result.get("error"),
+                ))
+            write_batch_summary(args.output, args.batch, len(original_files) if cfg.get("batch", {}).get("probe_before_run", True) else len(video_files), preflight_skipped, video_results)
         else:
             process_batch(args.batch, args.output, cfg)
 
@@ -902,9 +976,30 @@ def main():
                     str(f) for f in _Path(input_path).iterdir()
                     if f.is_file() and f.suffix.lower() in _video_exts
                 ])
+                preflight_skipped = []
+                if cfg.get("batch", {}).get("probe_before_run", True):
+                    original_files = list(video_files)
+                    video_files, bad_results = scan_batch(video_files)
+                    for bad in bad_results:
+                        preflight_skipped.append(build_batch_result_entry(
+                            None,
+                            Path(bad.path).name,
+                            "skipped",
+                            error=" | ".join(bad.issues),
+                        ))
                 eff_workers = resolve_max_workers(n_workers)
                 print(f"[BATCH] Parallel mode: {eff_workers} workers")
-                run_parallel_batch(video_files, args.output, cfg, workers=n_workers)
+                results = run_parallel_batch(video_files, args.output, cfg, workers=n_workers)
+                video_results = []
+                for i, result in enumerate(results, 1):
+                    video_results.append(build_batch_result_entry(
+                        i,
+                        result["video_name"],
+                        result["status"],
+                        stats=result.get("stats"),
+                        error=result.get("error"),
+                    ))
+                write_batch_summary(args.output, input_path, len(original_files) if cfg.get("batch", {}).get("probe_before_run", True) else len(video_files), preflight_skipped, video_results)
             else:
                 process_batch(input_path, args.output, cfg)
 

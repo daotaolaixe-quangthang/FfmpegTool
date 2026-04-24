@@ -167,13 +167,13 @@ def resolve_encoder(hw_cfg: dict) -> str:
         return detected
 
     if requested not in HW_PROFILES:
-        print(f"[HW] ⚠ Unknown encoder '{requested}'. Falling back to CPU.")
+        print(f"[HW] WARN Unknown encoder '{requested}'. Falling back to CPU.")
         return "cpu"
 
     # User explicitly requested an encoder — verify it's available (except cpu)
     if requested != "cpu" and not probe_encoder(requested):
         profile = get_hw_profile(requested)
-        print(f"[HW] ⚠ '{profile['label']}' not available on this machine. Falling back to CPU.")
+        print(f"[HW] WARN '{profile['label']}' not available on this machine. Falling back to CPU.")
         return "cpu"
 
     profile = get_hw_profile(requested)
@@ -185,11 +185,11 @@ def print_hw_report() -> None:
     """Print a hardware availability report to stdout (for diagnostics)."""
     print("\n[HW] Hardware Encoder Availability Report:")
     print(f"  {'ENCODER':<30} STATUS")
-    print(f"  {'─'*30} ──────")
+    print(f"  {'-'*30} ------")
     for key in ("nvenc", "qsv", "amf"):
         profile   = get_hw_profile(key)
         available = probe_encoder(key)
-        status    = "✓ Available" if available else "✗ Not found"
+        status    = "Available" if available else "Not found"
         print(f"  {profile['label']:<30} {status}")
-    print(f"  {'CPU x264 (fallback)':<30} ✓ Always available")
+    print(f"  {'CPU x264 (fallback)':<30} Always available")
     print()

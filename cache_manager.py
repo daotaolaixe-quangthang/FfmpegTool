@@ -306,7 +306,9 @@ def _remove_cache_entry(cache_dir: str, key: str):
 
 def _atomic_json_write(path: str, data: dict):
     """Write JSON to path atomically via a temp file."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)

@@ -1,0 +1,14 @@
+# Development and security-scanning dependencies.
+# NOT for production.  Install with:
+#   pip install -r requirements-dev.txt
+#
+# Then run CVE scan:
+#   pip-audit -r requirements.txt
+#
+# Then pin exact versions for production:
+#   pip-compile requirements.txt -o requirements.lock.txt
+
+-r requirements.txt
+
+pip-audit>=2.7.0
+pip-tools>=7.0.0

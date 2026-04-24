@@ -1,0 +1,42 @@
+name: Audit Tests
+
+on:
+  push:
+    branches: [ main, feature/** ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run audit test suite
+        run: |
+          python -m pytest tests/test_senior_audit.py `
+            --cov=main --cov=filters --cov=cache_manager `
+            --cov=queue_manager --cov=app `
+            --cov-report=term-missing `
+            --cov-report=xml:coverage.xml `
+            -v
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-xml
+          path: coverage.xml

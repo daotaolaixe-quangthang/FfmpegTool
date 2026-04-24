@@ -22,7 +22,11 @@ pip-wheel-metadata/
 .ruff_cache/
 .coverage
 .coverage.*
+coverage.xml
 htmlcov/
+
+# Runtime cache
+cache/
 
 # IDE / local tool settings
 .vscode/

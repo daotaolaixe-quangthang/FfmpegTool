@@ -9,3 +9,10 @@ scikit-image>=0.21.0
 flask>=3.0.0
 watchdog>=3.0.0
 psutil>=5.9.0
+
+# Security note (VULN-11):
+# After installing, pin exact versions for production:
+#   pip install pip-audit pip-tools
+#   pip-audit -r requirements.txt
+#   pip-compile requirements.txt -o requirements.lock.txt
+#   pip install -r requirements.lock.txt

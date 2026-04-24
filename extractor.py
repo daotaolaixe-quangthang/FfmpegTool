@@ -50,6 +50,10 @@ def extract_by_fps(
     else:
         vf_filter = f"fps={fps}"
 
+    # QSV decode yields GPU frames; download them before CPU filters.
+    if "qsv" in hw_args:
+        vf_filter = f"hwdownload,format=nv12,{vf_filter}"
+
     cmd = [
         "ffmpeg", "-y",           # -y (overwrite) MUST be a global option before -i
         *hw_args,                  # hardware decode acceleration (empty = CPU)
@@ -60,7 +64,11 @@ def extract_by_fps(
         output_pattern,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
+    try:
+        result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace",
+                                timeout=300)  # BUG-M1 FIX: 5-min ceiling prevents hung ffmpeg blocking forever
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ffmpeg timed out after 300s extracting frames from: {video_path}")
     if result.returncode != 0:
         parsed = parse_ffmpeg_error(result.stderr)
         raise RuntimeError(format_error(parsed))
@@ -101,7 +109,15 @@ def extract_by_scene(
 
     if not scenes:
         print("  [SCENE] No scenes detected -- falling back to 1 fps extraction")
-        return extract_by_fps(video_path, raw_dir, fps=1.0, jpeg_quality=jpeg_quality)
+        # BUG-H2 FIX: forward hwaccel_args and draft to the fallback call so
+        # that hardware acceleration and draft mode are not silently dropped
+        # when scene detection finds zero scenes.
+        return extract_by_fps(
+            video_path, raw_dir, fps=1.0,
+            jpeg_quality=jpeg_quality,
+            hwaccel_args=hwaccel_args,
+            draft=False,  # draft is meaningless for 1-fps fallback (no speed gain)
+        )
 
     hw_args = hwaccel_args or []
     frame_paths = []
@@ -120,7 +136,12 @@ def extract_by_scene(
             "-loglevel", "quiet",
             output_path,
         ]
-        result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
+        try:
+            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace",
+                                    timeout=60)  # BUG-M1 FIX: per-frame 60s ceiling for scene extraction
+        except subprocess.TimeoutExpired:
+            print(f"  [SCENE] Frame {i} timed out after 60s - skipping")
+            continue
         if result.returncode == 0 and os.path.exists(output_path):
             frame_paths.append(output_path)
         elif result.returncode != 0:

@@ -58,6 +58,9 @@ def validate_row(row: dict, known_presets: list[str] | None = None) -> list[str]
     if not video_src:
         errors.append("video_src is required")
     elif not os.path.isfile(video_src):
+        # BUG-L2 NOTE: file is validated at enqueue time only. If the file is
+        # moved or deleted between enqueue and queue processing it will fail at
+        # ffprobe (not here). Callers should keep source files stable.
         errors.append(f"video_src not found: {video_src}")
 
     # ── Required: output ──
@@ -181,7 +184,7 @@ def run_template(
         queue_mgr:     QueueManager instance.
         base_output:   Override output folder for all rows that lack one.
         known_presets: Valid preset names for validation; None = skip preset check.
-        dry_run:       If True, validate only — do NOT enqueue anything.
+        dry_run:       If True, validate only -- do NOT enqueue anything.
 
     Returns:
         {
@@ -195,6 +198,7 @@ def run_template(
     skipped = 0
     error_list = []
     item_ids = []
+    seen_identities: set[tuple] = set()
 
     for i, row in enumerate(rows):
         row = dict(row)  # work on a copy
@@ -212,6 +216,22 @@ def run_template(
                 "errors":    errs,
             })
             continue
+
+        # Deduplicate rows by (video_src, output, preset) identity before enqueue.
+        identity = (
+            os.path.normpath((row.get("video_src") or "").strip()),
+            os.path.normpath((row.get("output") or "").strip()),
+            (row.get("preset") or "").strip(),
+        )
+        if identity in seen_identities:
+            skipped += 1
+            error_list.append({
+                "row_index": i,
+                "video_src": identity[0],
+                "errors":    ["duplicate row: same video_src/output/preset already queued"],
+            })
+            continue
+        seen_identities.add(identity)
 
         if not dry_run:
             # Build cfg_overrides from template metadata fields

@@ -54,6 +54,26 @@ CACHE_MGR = CacheManager()
 # ── Phase 3: Watch daemon (shared singleton) ──
 WATCH_DAEMON = get_daemon(queue_mgr=QUEUE_MGR)
 
+# ── Phase 4: queue runner guard ──
+QUEUE_RUNNER_LOCK = threading.Lock()
+QUEUE_RUNNER_THREAD: threading.Thread | None = None
+
+# ── Security: concurrent job limit (VULN-6) ──
+# Hard cap on active pipeline subprocesses to prevent CPU/disk exhaustion.
+MAX_CONCURRENT_JOBS = 4
+_JOB_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_JOBS)
+
+# ── Security: SSE max idle pings before auto-disconnect (VULN-7) ──
+# Each ping fires after a 30-second queue.Empty timeout.
+# 120 pings * 30s = 60 minutes maximum idle connection lifetime.
+_MAX_SSE_PINGS = 120
+
+# ── Security: path sanitization regex for error messages (VULN-10) ──
+_PATH_LEAK_RE = re.compile(
+    r"[A-Za-z]:[/\\][^\s,;'\"]{3,}"   # Windows absolute  e.g. C:\Users\...
+    r"|/[a-zA-Z0-9_./-]{8,}"           # POSIX absolute    e.g. /home/user/...
+)
+
 
 # ─────────────────────────────────────────────
 # Helpers
@@ -115,33 +135,58 @@ def load_result_stats(output_dir: str, video_name: str) -> dict | None:
     """Try to load report.json from the output folder."""
     report_path = os.path.join(output_dir, video_name, "report.json")
     if os.path.exists(report_path):
-        with open(report_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(report_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
     return None
 
 
 def load_url_result_stats(output_dir: str) -> dict | None:
     """
-    MISSED-2 FIX: In URL mode, yt-dlp may save the file as
-    'downloaded_video.f123.mp4' (merged stream filename) instead of
-    'downloaded_video.mp4', causing the video folder stem to differ.
-    Scan the output_dir for any subfolder containing report.json,
-    preferring 'downloaded_video' but accepting any glob match.
+    Load stats for the most recent URL run.
+
+    Prefer the explicit marker written by main.py URL mode so the app resolves
+    the exact processed report even when yt-dlp used a non-exact filename.
+    Falls back to legacy downloaded_video* scanning, then newest report.json.
     """
     output_path = Path(output_dir)
     if not output_path.is_dir():
         return None
 
-    # Prefer exact match first
+    marker = output_path / "_last_url_result.json"
+    if marker.exists():
+        try:
+            with open(marker, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            report_path = Path(data.get("report_path", ""))
+            if report_path.is_file():
+                with open(report_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            pass
+
     exact = output_path / "downloaded_video" / "report.json"
     if exact.exists():
         with open(exact, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    # Fall back: find any subfolder whose name starts with 'downloaded_video'
     for candidate in sorted(output_path.glob("downloaded_video*/report.json")):
         with open(candidate, "r", encoding="utf-8") as f:
             return json.load(f)
+
+    report_files = sorted(
+        output_path.glob("*/report.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in report_files:
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
 
     return None
 
@@ -289,7 +334,8 @@ def load_batch_stats(output_dir: str) -> dict | None:
                 "output_folder":       r.get("output_folder", str(sub / "unique_frames")),
                 "error":               None,
             })
-        except Exception:
+        except (json.JSONDecodeError, OSError, AttributeError, TypeError) as exc:
+            print(f"[APP] Warning: skipping malformed report '{report_file}': {exc}")
             continue
 
     if videos_found == 0:
@@ -334,6 +380,107 @@ def _is_tqdm_line(line: str) -> bool:
 
 
 # ─────────────────────────────────────────────
+# Security helpers
+# ─────────────────────────────────────────────
+
+def _sanitize_error_msg(exc: Exception, max_len: int = 400) -> str:
+    """
+    Remove absolute filesystem paths from an exception message before returning
+    it over the API.  Internal paths leak server layout, usernames, and drive
+    letters.  Log the full message server-side; send only the sanitized version
+    to the client (VULN-10).
+    """
+    return _PATH_LEAK_RE.sub("<path>", str(exc))[:max_len]
+
+
+def _is_unsafe_path(path: str) -> bool:
+    """
+    Return True if a filesystem path string contains patterns that must be
+    rejected regardless of where the path points (VULN-4, VULN-5).
+
+    Blocked patterns:
+    - Null bytes  - can truncate path validation in C-layer libraries
+    - UNC paths   - \\\\server\\share triggers outbound SMB auth (credential leak)
+
+    Note: Arbitrary absolute paths are NOT blocked here because the tool
+    legitimately processes files anywhere on the local filesystem.  Bind the
+    Flask server to 127.0.0.1 (VULN-1) to prevent remote clients from
+    supplying paths in the first place.
+    """
+    if not path:
+        return False
+    if "\x00" in path:
+        return True
+    # UNC detection: normalise slashes then check for leading double-backslash
+    if path.replace("/", "\\").startswith("\\\\"):
+        return True
+    return False
+
+
+def _sanitize_stats_for_api(stats: dict | None) -> dict | None:
+    """
+    Strip absolute filesystem paths from a stats dict before sending it to the
+    client (VULN-9).
+
+    - Numeric counters, ratios, and metadata pass through unchanged.
+    - Fields that the JavaScript UI tests as truthy/falsy (top_frames_dir,
+      score_report_path) are converted to True/False so the UI checks still
+      work: if (stats.top_frames_dir) {...}
+    - Fields containing full local paths (output_dir, output_folder,
+      final_paths, batch_preview_path) are dropped entirely; the UI reaches
+      those resources through job_id-scoped API endpoints that resolve paths
+      server-side.
+    """
+    if not stats:
+        return stats
+
+    _SAFE_KEYS = {
+        # batch aggregate counters
+        "is_batch", "total_videos", "videos_processed", "videos_skipped",
+        "videos_failed", "videos_non_success",
+        "total_raw_frames", "removed_blurry", "removed_duplicate",
+        "final_unique_frames", "reduction_rate",
+        "batch_preview_exists", "generated_at",
+        # single-video counters (internal key names from filters.py)
+        "total_raw", "after_blur_filter", "after_dedup_filter",
+        "removed_blur", "final_count",
+        # filter configuration values
+        "blur_threshold", "similarity_threshold", "dedup_method",
+        # scorer
+        "scorer_enabled", "top_n_requested", "top_n_selected",
+        # misc
+        "cache_hit",
+        # dedup lists already contain only basenames + numeric scores, no paths
+        "blur_removed_list", "dup_removed_list",
+    }
+
+    # Path keys that JS only uses as truthy/falsy existence flags
+    _PATH_TO_BOOL = {
+        "top_frames_dir":    "top_frames_dir",
+        "score_report_path": "score_report_path",
+    }
+
+    out: dict = {}
+    for k, v in stats.items():
+        if k in _SAFE_KEYS:
+            out[k] = v
+        elif k in _PATH_TO_BOOL:
+            # Preserve key name so existing JS checks continue to work
+            out[_PATH_TO_BOOL[k]] = bool(v)
+        # Silently drop: output_dir, output_folder, final_paths,
+        #                batch_preview_path, and any other path field.
+
+    # Sanitize per-video results in batch stats: strip output_folder per video
+    if "video_results" in stats:
+        out["video_results"] = [
+            {k2: v2 for k2, v2 in vr.items() if k2 != "output_folder"}
+            for vr in (stats.get("video_results") or [])
+        ]
+
+    return out
+
+
+# ─────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────
 
@@ -353,7 +500,7 @@ def api_presets():
         presets = list_presets()
         return jsonify({"presets": presets})
     except Exception as e:
-        return jsonify({"error": str(e), "presets": []}), 500
+        return jsonify({"error": _sanitize_error_msg(e), "presets": []}), 500
 
 
 @app.route("/api/run", methods=["POST"])
@@ -370,6 +517,21 @@ def api_run():
     if not data.get("output"):
         return jsonify({"error": "Output folder is required"}), 400
 
+    # Block unsafe path patterns: null bytes and UNC paths (VULN-4)
+    for field_name in ("input", "output", "batch"):
+        val = (data.get(field_name) or "").strip()
+        if val and _is_unsafe_path(val):
+            return jsonify({"error": f"Invalid characters in '{field_name}' path."}), 400
+
+    # Enforce concurrent job limit before spawning a subprocess (VULN-6)
+    if not _JOB_SEMAPHORE.acquire(blocking=False):
+        return jsonify({
+            "error": (
+                f"Too many concurrent jobs (max {MAX_CONCURRENT_JOBS}). "
+                "Wait for a running job to finish and try again."
+            )
+        }), 429
+
     job_id = str(uuid.uuid4())[:8]
     q: queue.Queue = queue.Queue()
     cmd = build_command(data)
@@ -385,88 +547,95 @@ def api_run():
         JOBS[job_id] = {"queue": q, "status": "running", "stats": None}
 
     def run_pipeline():
-        with JOBS_LOCK:
-            job = JOBS.get(job_id)
-            if job:
-                job["cmd"] = " ".join(cmd)  # mutate inside lock for consistency
+        # Semaphore released in finally so it is always returned, even on crash.
         try:
-            env = {
-                **os.environ,
-                "PYTHONIOENCODING": "utf-8",   # subprocess writes utf-8
-                "PYTHONUNBUFFERED": "1",        # flush output immediately
-            }
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                # IMPORTANT: explicit utf-8 + replace so block chars don't crash
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                cwd=TOOL_DIR,
-                env=env
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if job:
+                    job["cmd"] = " ".join(cmd)  # mutate inside lock for consistency
+            try:
+                env = {
+                    **os.environ,
+                    "PYTHONIOENCODING": "utf-8",   # subprocess writes utf-8
+                    "PYTHONUNBUFFERED": "1",        # flush output immediately
+                }
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    # IMPORTANT: explicit utf-8 + replace so block chars don't crash
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    cwd=TOOL_DIR,
+                    env=env
+                )
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    # Skip tqdm progress bar lines — they contain % and | and \r
+                    # and look like: "  Blur check:  66%|██████    | 212/322"
+                    if _is_tqdm_line(line):
+                        continue
+                    q.put(("log", line))
+                proc.wait()
+                exit_code = proc.returncode
+            except Exception as e:
+                q.put(("log", f"[ERROR] {e}"))
+                exit_code = 1
+
+            # Try to load stats
+            output_dir = data.get("output", "")
+
+            # Determine if this was a batch run:
+            #   - explicit batch flag, or
+            #   - --input pointed at a directory (auto-batch)
+            is_batch = (
+                data.get("batch", False)
+                or (
+                    not data.get("url", "").strip()
+                    and data.get("input", "").strip()
+                    and os.path.isdir(data.get("input", "").strip())
+                )
             )
-            for line in proc.stdout:
-                line = line.rstrip()
-                # Skip tqdm progress bar lines — they contain % and | and \r
-                # and look like: "  Blur check:  66%|██████    | 212/322"
-                if _is_tqdm_line(line):
-                    continue
-                q.put(("log", line))
-            proc.wait()
-            exit_code = proc.returncode
-        except Exception as e:
-            q.put(("log", f"[ERROR] {e}"))
-            exit_code = 1
 
-        # Try to load stats
-        output_dir = data.get("output", "")
+            if is_batch:
+                stats = load_batch_stats(output_dir)
+            elif data.get("url", "").strip():
+                # URL mode: downloader saves as 'downloaded_video.{ext}' but may
+                # fall back to a glob-matched filename. Scan actual files to find
+                # the right report folder (MISSED-2 fix).
+                stats = load_url_result_stats(output_dir)
+            else:
+                video_name = Path(data.get("input", "video")).stem
+                stats = load_result_stats(output_dir, video_name)
 
-        # Determine if this was a batch run:
-        #   - explicit batch flag, or
-        #   - --input pointed at a directory (auto-batch)
-        is_batch = (
-            data.get("batch", False)
-            or (
-                not data.get("url", "").strip()
-                and data.get("input", "").strip()
-                and os.path.isdir(data.get("input", "").strip())
-            )
-        )
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if job:
+                    job["stats"] = stats
+                    job["status"] = "done" if exit_code == 0 else "error"
 
-        if is_batch:
-            stats = load_batch_stats(output_dir)
-        elif data.get("url", "").strip():
-            # URL mode: downloader saves as 'downloaded_video.{ext}' but may
-            # fall back to a glob-matched filename. Scan actual files to find
-            # the right report folder (MISSED-2 fix).
-            stats = load_url_result_stats(output_dir)
-        else:
-            video_name = Path(data.get("input", "video")).stem
-            stats = load_result_stats(output_dir, video_name)
+            # BUG-H3 FIX: persist stats in COMPLETED_STATS before signalling "done"
+            # so the SSE reader can retrieve them even if the job gets evicted from
+            # JOBS between the "done" signal and the SSE handler reading stats.
+            with COMPLETED_STATS_LOCK:
+                COMPLETED_STATS[job_id] = stats
+                # Evict oldest completed entries if dict grows beyond 100
+                if len(COMPLETED_STATS) > 100:
+                    oldest = next(iter(COMPLETED_STATS))
+                    del COMPLETED_STATS[oldest]
 
-        with JOBS_LOCK:
-            job = JOBS.get(job_id)
-            if job:
-                job["stats"] = stats
-                job["status"] = "done" if exit_code == 0 else "error"
-
-        # BUG-H3 FIX: persist stats in COMPLETED_STATS before signalling "done"
-        # so the SSE reader can retrieve them even if the job gets evicted from
-        # JOBS between the "done" signal and the SSE handler reading stats.
-        with COMPLETED_STATS_LOCK:
-            COMPLETED_STATS[job_id] = stats
-            # Evict oldest completed entries if dict grows beyond 100
-            if len(COMPLETED_STATS) > 100:
-                oldest = next(iter(COMPLETED_STATS))
-                del COMPLETED_STATS[oldest]
-
-        q.put(("done", str(exit_code)))
+            q.put(("done", str(exit_code)))
+        finally:
+            _JOB_SEMAPHORE.release()
 
     thread = threading.Thread(target=run_pipeline, daemon=True)
     thread.start()
 
-    return jsonify({"job_id": job_id, "command": " ".join(cmd)})
+    # Do NOT echo the full command back to the client: it contains absolute
+    # filesystem paths (VULN-9).  The job_id is sufficient for the UI to
+    # stream logs and poll status.
+    return jsonify({"job_id": job_id})
 
 
 @app.route("/api/stream/<job_id>")
@@ -480,9 +649,11 @@ def api_stream(job_id: str):
     q = job["queue"]
 
     def generate():
+        ping_count = 0
         while True:
             try:
                 msg_type, msg = q.get(timeout=30)
+                ping_count = 0  # reset idle counter on any activity
                 if msg_type == "log":
                     # Escape for SSE
                     safe = msg.replace("\n", " ").replace("\r", "")
@@ -497,9 +668,19 @@ def api_stream(job_id: str):
                         with JOBS_LOCK:
                             finished_job = JOBS.get(job_id, {})
                         stats = finished_job.get("stats")
+                    # SSE carries full stats so the frontend can call open-folder
+                    # and preview endpoints via the stats-based paths.  Paths are
+                    # resolved server-side in those endpoints; the client receives
+                    # them only transiently in this event.
                     yield f"data: {json.dumps({'type': 'done', 'exit_code': msg, 'stats': stats})}\n\n"
                     break
             except queue.Empty:
+                ping_count += 1
+                # VULN-7: close idle SSE connections after _MAX_SSE_PINGS * 30s.
+                # Prevents thread/file-descriptor exhaustion from abandoned clients.
+                if ping_count >= _MAX_SSE_PINGS:
+                    yield f"data: {json.dumps({'type': 'timeout', 'message': 'Connection closed after 60 minutes of inactivity.'})}\n\n"
+                    break
                 yield f"data: {json.dumps({'type': 'ping'})}\n\n"
 
     return Response(
@@ -519,7 +700,12 @@ def api_job_status(job_id: str):
         job = JOBS.get(job_id)
     if not job:
         return jsonify({"error": "Not found"}), 404
-    return jsonify({"status": job["status"], "stats": job.get("stats")})
+    # Sanitize stats: strip absolute filesystem paths before sending to client
+    # (VULN-9).  The UI only needs counters and existence flags, not full paths.
+    return jsonify({
+        "status": job["status"],
+        "stats":  _sanitize_stats_for_api(job.get("stats")),
+    })
 
 
 @app.route("/api/open-folder", methods=["POST"])
@@ -527,28 +713,56 @@ def api_open_folder():
     """
     Open a folder in Windows Explorer.
 
-    FE-2 FIX: Accepts either a raw 'folder' path OR full job stats dict.
-    When 'stats' is provided, resolves the correct folder server-side via
-    resolve_open_folder() so the frontend doesn't need to strip path suffixes.
-    This eliminates the duplicated path-resolution logic that existed in both
-    the frontend (openFolder()) and the backend (resolve_open_folder()).
+    Accepts (in priority order):
+      1. {"job_id": "<id>"}  -- preferred: resolves folder server-side from
+         job stats, no client-controlled path at all (VULN-5 fix).
+      2. {"stats": {...}}    -- legacy: stats dict provided by client; folder
+         is still resolved server-side via resolve_open_folder().
+      3. {"folder": "<path>"} -- legacy raw path; kept for backward-compat
+         but validated against unsafe patterns.
+
+    FE-2 FIX (preserved): server-side resolution eliminates duplicated
+    path-stripping logic that previously lived in the frontend.
     """
     data = request.get_json()
     if not data:
         return jsonify({"error": "No data"}), 400
 
-    # If caller sends full stats dict, resolve the folder server-side.
-    if "stats" in data:
+    # ── Path 1: resolve entirely server-side from job_id (preferred) ──
+    if "job_id" in data:
+        jid = str(data["job_id"])
+        with JOBS_LOCK:
+            job = JOBS.get(jid)
+        stats = job.get("stats") if job else None
+        if stats is None:
+            with COMPLETED_STATS_LOCK:
+                stats = COMPLETED_STATS.get(jid)
+        if not stats:
+            return jsonify({"error": "Job not found or no stats available."}), 404
+        folder = resolve_open_folder(stats)
+
+    # ── Path 2: stats dict provided by client (legacy; resolved server-side) ──
+    elif "stats" in data:
         folder = resolve_open_folder(data["stats"])
+
+    # ── Path 3: raw folder string (legacy; validated below) ──
     else:
         folder = data.get("folder", "")
 
     if not folder:
         return jsonify({"error": "No folder specified"}), 400
+
+    # Security: block UNC paths - opening \\attacker\share triggers outbound
+    # SMB authentication and leaks NTLM credentials (VULN-5).
+    if _is_unsafe_path(folder):
+        return jsonify({"error": "Invalid folder path."}), 400
+
     if os.path.isdir(folder):
         subprocess.Popen(["explorer", os.path.normpath(folder)])
         return jsonify({"ok": True})
-    return jsonify({"error": f"Folder not found: {folder}"}), 404
+
+    # Omit the actual path from the error response to avoid path disclosure
+    return jsonify({"error": "Folder not found."}), 404
 
 
 @app.route("/api/preview/<job_id>")
@@ -556,9 +770,9 @@ def api_preview(job_id: str):
     """Return HTML preview path for the job."""
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-    if not job or not job.get("stats"):
+        stats = job.get("stats") if job else None
+    if not stats:
         return jsonify({"error": "No stats"}), 404
-    stats = job["stats"]
 
     preview = resolve_preview_path(stats)
 
@@ -574,10 +788,10 @@ def api_serve_preview(job_id: str):
     """
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-    if not job or not job.get("stats"):
+        stats = job.get("stats") if job else None
+    if not stats:
         return "Job not found or no stats available.", 404
 
-    stats = job["stats"]
     preview_path = resolve_preview_path(stats)
     preview_root = resolve_preview_root(stats)
 
@@ -618,10 +832,11 @@ def api_serve_preview_asset(job_id: str, asset_path: str):
     """Serve assets referenced by preview HTML when opened through Flask."""
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-    if not job or not job.get("stats"):
+        stats = job.get("stats") if job else None
+    if not stats:
         return "Job not found or no stats available.", 404
 
-    preview_root = resolve_preview_root(job["stats"])
+    preview_root = resolve_preview_root(stats)
     if not preview_root or not preview_root.exists():
         return "Preview root not found.", 404
 
@@ -721,27 +936,48 @@ def api_queue_run():
     Runs queue in a daemon thread so the API returns immediately.
     Response: {"started": true, "pending": N}
     """
+    global QUEUE_RUNNER_THREAD
+
     pending = QUEUE_MGR.pending_count()
     if pending == 0:
         return jsonify({"started": False, "message": "No pending items", "pending": 0})
 
-    # BUG-M2 FIX: imports were inside the thread function — moved here so they
-    # are resolved at call time (not inside the daemon thread on every invocation).
-    from main import apply_defaults, load_config, process_video
-    from hw_detect import resolve_encoder, get_ffmpeg_hwaccel_args
+    with QUEUE_RUNNER_LOCK:
+        if QUEUE_RUNNER_THREAD is not None and QUEUE_RUNNER_THREAD.is_alive():
+            return jsonify({
+                "started": False,
+                "message": "Queue runner already active",
+                "pending": pending,
+            })
 
-    def _run_queue():
-        cfg = apply_defaults(load_config("config.json"))
-        hw_key = resolve_encoder(cfg["hardware"])
-        cfg["extraction"]["_hwaccel_args"] = get_ffmpeg_hwaccel_args(hw_key)
-        # BUG-H1 FIX: pass incrementing batch_index so {index} naming token works
-        batch_index = 0
-        while QUEUE_MGR.pending_count() > 0:
-            batch_index += 1
-            QUEUE_MGR.run_next(cfg, process_video, batch_index=batch_index)
+        # BUG-M2 FIX: imports were inside the thread function — moved here so they
+        # are resolved at call time (not inside the daemon thread on every invocation).
+        from main import apply_defaults, load_config, process_video
+        from hw_detect import resolve_encoder, get_ffmpeg_hwaccel_args
 
-    t = threading.Thread(target=_run_queue, daemon=True)
-    t.start()
+        def _run_queue():
+            global QUEUE_RUNNER_THREAD
+            try:
+                cfg = apply_defaults(load_config("config.json"))
+                if cfg["hardware"].get("enable_hwaccel", True):
+                    hw_key = resolve_encoder(cfg["hardware"])
+                    cfg["hardware"]["_resolved_key"] = hw_key
+                    cfg["extraction"]["_hwaccel_args"] = get_ffmpeg_hwaccel_args(hw_key)
+                else:
+                    cfg["hardware"]["_resolved_key"] = "cpu"
+                    cfg["extraction"]["_hwaccel_args"] = []
+
+                # BUG-H1 FIX: pass incrementing batch_index so {index} naming token works
+                batch_index = 0
+                while QUEUE_MGR.pending_count() > 0:
+                    batch_index += 1
+                    QUEUE_MGR.run_next(cfg, process_video, batch_index=batch_index)
+            finally:
+                with QUEUE_RUNNER_LOCK:
+                    QUEUE_RUNNER_THREAD = None
+
+        QUEUE_RUNNER_THREAD = threading.Thread(target=_run_queue, daemon=True)
+        QUEUE_RUNNER_THREAD.start()
     return jsonify({"started": True, "pending": pending})
 
 
@@ -836,7 +1072,7 @@ def api_cache_stats():
     try:
         return jsonify(CACHE_MGR.stats())
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": _sanitize_error_msg(exc)}), 500
 
 
 @app.route("/api/cache/clear", methods=["DELETE"])
@@ -850,7 +1086,7 @@ def api_cache_clear():
         purged = CACHE_MGR.purge_all()
         return jsonify({"purged": purged})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": _sanitize_error_msg(exc)}), 500
 
 
 # ──────────────────────────────────────────────
@@ -879,9 +1115,9 @@ def api_watch_start():
         state = WATCH_DAEMON.start(folder, output, preset)
         return jsonify(state)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return jsonify({"error": _sanitize_error_msg(exc)}), 400
     except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 503
+        return jsonify({"error": _sanitize_error_msg(exc)}), 503
 
 
 @app.route("/api/watch/stop", methods=["POST"])
@@ -953,7 +1189,7 @@ def api_batch_run():
     if not video_files:
         return jsonify({"started": False, "message": "No video files found", "video_count": 0})
 
-    from main import apply_defaults, load_config
+    from main import apply_defaults, load_config, build_batch_result_entry, write_batch_summary
     from hw_detect import resolve_encoder, get_ffmpeg_hwaccel_args
     from parallel_runner import run_parallel_batch
 
@@ -966,8 +1202,30 @@ def api_batch_run():
             cfg = apply_preset(cfg, preset)
         hw_key = resolve_encoder(cfg["hardware"])
         cfg["extraction"]["_hwaccel_args"] = get_ffmpeg_hwaccel_args(hw_key)
+        files_to_run = video_files
+        preflight_skipped = []
+        if cfg.get("batch", {}).get("probe_before_run", True):
+            from probe_first import scan_batch
+            files_to_run, bad_results = scan_batch(video_files)
+            for bad in bad_results:
+                preflight_skipped.append(build_batch_result_entry(
+                    None,
+                    Path(bad.path).name,
+                    "skipped",
+                    error=" | ".join(bad.issues),
+                ))
         n = workers if do_parallel else 1
-        run_parallel_batch(video_files, output_dir, cfg, workers=n)
+        results = run_parallel_batch(files_to_run, output_dir, cfg, workers=n)
+        video_results = []
+        for i, result in enumerate(results, 1):
+            video_results.append(build_batch_result_entry(
+                i,
+                result["video_name"],
+                result["status"],
+                stats=result.get("stats"),
+                error=result.get("error"),
+            ))
+        write_batch_summary(output_dir, input_folder, len(video_files), preflight_skipped, video_results)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -1027,16 +1285,24 @@ def api_dag_run():
         else:
             spec = validate_dag_spec(data)
     except (FileNotFoundError, ValueError) as exc:
-        return jsonify({"error": str(exc)}), 400
+        return jsonify({"error": _sanitize_error_msg(exc)}), 400
 
     try:
+        from hw_detect import resolve_encoder, get_ffmpeg_hwaccel_args
         cfg = apply_defaults(load_config("config.json"))
+        if cfg["hardware"].get("enable_hwaccel", True):
+            hw_key = resolve_encoder(cfg["hardware"])
+            cfg["hardware"]["_resolved_key"] = hw_key
+            cfg["extraction"]["_hwaccel_args"] = get_ffmpeg_hwaccel_args(hw_key)
+        else:
+            cfg["hardware"]["_resolved_key"] = "cpu"
+            cfg["extraction"]["_hwaccel_args"] = []
         result = run_dag(spec, cfg, default_output=spec.get("output") or "", workers=workers)
         return jsonify(result)
     except FileNotFoundError as exc:
-        return jsonify({"error": str(exc)}), 404
+        return jsonify({"error": _sanitize_error_msg(exc)}), 404
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": _sanitize_error_msg(exc)}), 500
 
 
 # ──────────────────────────────────────────────
@@ -1080,4 +1346,4 @@ if __name__ == "__main__":
     WATCH_DAEMON.resume_from_state()
     # Open browser after a short delay
     threading.Timer(1.2, lambda: webbrowser.open(url)).start()
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)

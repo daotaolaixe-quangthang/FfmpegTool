@@ -30,11 +30,11 @@ def save_json_report(stats: dict, output_dir: str, video_name: str) -> str:
         "top_n_selected"    : stats.get("top_n_selected"),   # None if scorer disabled
         "top_frames_dir"    : stats.get("top_frames_dir"),
         "score_report_path" : stats.get("score_report_path"),
-        "output_folder"     : stats["output_dir"],
+        "output_folder"     : stats.get("output_dir", ""),
         "blur_threshold_used"       : stats.get("blur_threshold"),
         "similarity_threshold_used" : stats.get("similarity_threshold"),
-        "blurry_files_removed"      : stats["blur_removed_list"],
-        "duplicate_files_removed"   : stats["dup_removed_list"],
+        "blurry_files_removed"      : stats.get("blur_removed_list", []),
+        "duplicate_files_removed"   : stats.get("dup_removed_list", []),
     }
 
     report_path = os.path.join(output_dir, "report.json")
@@ -227,7 +227,7 @@ def save_html_preview(final_paths: list[str], output_dir: str,
     # REPORTER-1: warn user if preview HTML is large (base64 frames can balloon fast)
     size_mb = os.path.getsize(html_path) / (1024 * 1024)
     if size_mb > 10:
-        print(f"[WARN] HTML preview is {size_mb:.0f}MB — may load slowly in browser. "
+        print(f"[WARN] HTML preview is {size_mb:.0f}MB - may load slowly in browser. "
               "Consider raising jpeg_quality (e.g. 5-8) or reducing fps.")
 
     return html_path

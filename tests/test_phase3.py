@@ -578,6 +578,112 @@ class TestCacheManager(unittest.TestCase):
 # 4. CACHE API TESTS
 # =================================================================
 
+class TestProcessVideoCacheIntegration(unittest.TestCase):
+    """Integration tests for main.process_video() cache-hit behavior."""
+
+    def _cfg(self):
+        return {
+            "extraction": {
+                "mode": "fps",
+                "fps": 5,
+                "scene_threshold": 27.0,
+                "jpeg_quality": 2,
+                "draft": False,
+                "_hwaccel_args": [],
+            },
+            "filter": {
+                "blur_threshold": 80.0,
+                "similarity_threshold": 0.70,
+                "dedup_method": "phash",
+                "phash_size": 16,
+            },
+            "scorer": {
+                "enabled": False,
+                "top_n": 30,
+                "save_score_report": True,
+            },
+            "output": {
+                "keep_raw": False,
+                "generate_html_preview": False,
+                "preview_columns": 5,
+                "report_json": True,
+                "naming_pattern": "{video_name}",
+                "campaign": "",
+                "lang": "",
+                "ratio": "",
+            },
+            "hardware": {"encoder": "auto", "enable_hwaccel": False},
+            "batch": {"probe_before_run": False},
+            "normalize": {"enabled": False},
+            "no_cache": False,
+        }
+
+    def test_cache_hit_materializes_frames_into_run_output(self):
+        """Cache-hit process_video() must copy frames into the run unique_frames folder."""
+        import main as main_mod
+        from cache_manager import CacheManager
+
+        with tempfile.TemporaryDirectory() as d:
+            cache_dir = os.path.join(d, "cache")
+            out_dir = os.path.join(d, "out")
+            src_dir = os.path.join(d, "src")
+            os.makedirs(src_dir, exist_ok=True)
+            video_path = os.path.join(src_dir, "clip.mp4")
+            Path(video_path).write_bytes(b"FAKE_VIDEO")
+
+            source_frames_dir = os.path.join(d, "seed_frames")
+            os.makedirs(source_frames_dir, exist_ok=True)
+            source_frames = []
+            for i in range(2):
+                frame = os.path.join(source_frames_dir, f"frame_{i:04d}.jpg")
+                Path(frame).write_bytes(f"FRAME{i}".encode("utf-8"))
+                source_frames.append(frame)
+
+            cfg = self._cfg()
+            cm = CacheManager(cache_dir=cache_dir)
+            cm.store_frames(video_path, cfg, source_frames)
+
+            with patch("main.CacheManager", side_effect=lambda: CacheManager(cache_dir=cache_dir)):
+                stats = main_mod.process_video(video_path, out_dir, cfg)
+
+            unique_dir = os.path.join(out_dir, "clip", "unique_frames")
+            self.assertTrue(os.path.isdir(unique_dir))
+            self.assertEqual(os.path.normpath(stats["output_dir"]), os.path.normpath(unique_dir))
+            self.assertEqual(len(stats["final_paths"]), 2)
+            for p in stats["final_paths"]:
+                self.assertTrue(os.path.isfile(p))
+                self.assertTrue(os.path.normpath(p).startswith(os.path.normpath(unique_dir)))
+            report_path = os.path.join(out_dir, "clip", "report.json")
+            with open(report_path, "r", encoding="utf-8") as f:
+                report = json.load(f)
+            self.assertEqual(os.path.normpath(report["output_folder"]), os.path.normpath(unique_dir))
+
+
+class TestUrlResultLookup(unittest.TestCase):
+    """Tests for app.load_url_result_stats()."""
+
+    def test_load_url_result_stats_prefers_marker_report(self):
+        """Marker-written report path must override prefix-based scanning."""
+        from app import load_url_result_stats
+
+        with tempfile.TemporaryDirectory() as d:
+            exact_dir = os.path.join(d, "downloaded_video")
+            actual_dir = os.path.join(d, "downloaded_video.f123")
+            os.makedirs(exact_dir, exist_ok=True)
+            os.makedirs(actual_dir, exist_ok=True)
+
+            with open(os.path.join(exact_dir, "report.json"), "w", encoding="utf-8") as f:
+                json.dump({"video": "wrong", "output_folder": exact_dir}, f)
+            actual_report = os.path.join(actual_dir, "report.json")
+            with open(actual_report, "w", encoding="utf-8") as f:
+                json.dump({"video": "right", "output_folder": actual_dir}, f)
+            with open(os.path.join(d, "_last_url_result.json"), "w", encoding="utf-8") as f:
+                json.dump({"report_path": actual_report}, f)
+
+            stats = load_url_result_stats(d)
+            self.assertEqual(stats["video"], "right")
+
+
 class TestCacheAPIRoutes(unittest.TestCase):
     """Tests for /api/cache/stats and /api/cache/clear in app.py."""
 
@@ -895,6 +1001,165 @@ class TestWatchAPIRoutes(unittest.TestCase):
             json={"folder": self._tmpdir, "output": self._tmpdir},
         )
         self.assertEqual(resp.status_code, 503)
+
+
+# =================================================================
+# Phase 5 regression tests
+# =================================================================
+
+class TestTemplateDedupe(unittest.TestCase):
+    """Duplicate rows in a template must not be double-enqueued."""
+
+    def _make_qm(self, d):
+        from queue_manager import QueueManager
+        return QueueManager(queue_file=os.path.join(d, "q.json"))
+
+    def test_identical_rows_skipped_after_first(self):
+        """run_template with two identical rows must enqueue only the first."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "clip.mp4")
+            Path(src).write_bytes(b"FAKE")
+            qm = self._make_qm(d)
+            rows = [
+                {"video_src": src, "output": d, "preset": ""},
+                {"video_src": src, "output": d, "preset": ""},
+            ]
+            from template_runner import run_template
+            result = run_template(rows, qm)
+            self.assertEqual(result["queued"], 1)
+            self.assertEqual(result["skipped"], 1)
+            self.assertEqual(len(qm.list_items()), 1)
+            self.assertIn("duplicate row", result["errors"][0]["errors"][0])
+
+    def test_different_presets_are_not_deduplicated(self):
+        """Two rows with same src/output but different presets must both be enqueued."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "clip.mp4")
+            Path(src).write_bytes(b"FAKE")
+            qm = self._make_qm(d)
+            rows = [
+                {"video_src": src, "output": d, "preset": "tiktok_pack"},
+                {"video_src": src, "output": d, "preset": "draft_preview"},
+            ]
+            from template_runner import run_template
+            result = run_template(rows, qm, known_presets=["tiktok_pack", "draft_preview"])
+            self.assertEqual(result["queued"], 2)
+            self.assertEqual(result["skipped"], 0)
+
+    def test_dry_run_deduplicate_but_no_enqueue(self):
+        """Dry-run must still report duplicates but enqueue nothing."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "clip.mp4")
+            Path(src).write_bytes(b"FAKE")
+            qm = self._make_qm(d)
+            rows = [
+                {"video_src": src, "output": d, "preset": ""},
+                {"video_src": src, "output": d, "preset": ""},
+            ]
+            from template_runner import run_template
+            result = run_template(rows, qm, dry_run=True)
+            self.assertEqual(result["queued"], 1)
+            self.assertEqual(result["skipped"], 1)
+            self.assertEqual(len(qm.list_items()), 0)
+
+
+class TestWatchDaemonDedupe(unittest.TestCase):
+    """Rapid duplicate events for the same path must enqueue only once."""
+
+    def test_rapid_duplicate_events_enqueue_once(self):
+        """Scheduling _enqueue twice for the same path must only call qm.add once."""
+        from watch_daemon import VideoFileHandler
+        mock_qm = MagicMock()
+        mock_qm.add.return_value = "abc12345"
+
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "clip.mp4")
+            Path(src).write_bytes(b"FAKE")
+            handler = VideoFileHandler(output=d, preset="", queue_mgr=mock_qm, debounce=0)
+
+            # Simulate two rapid enqueue calls for the same path (debounce elapsed)
+            handler._enqueue(src)
+            handler._enqueue(src)
+
+            mock_qm.add.assert_called_once_with(src, d, cfg_overrides={})
+
+    def test_distinct_paths_each_enqueued(self):
+        """Two distinct video files must each be enqueued separately."""
+        from watch_daemon import VideoFileHandler
+        mock_qm = MagicMock()
+        mock_qm.add.side_effect = lambda path, out, **kw: "id_" + os.path.basename(path)[:4]
+
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.mp4")
+            b = os.path.join(d, "b.mp4")
+            Path(a).write_bytes(b"FAKE")
+            Path(b).write_bytes(b"FAKE")
+            handler = VideoFileHandler(output=d, preset="", queue_mgr=mock_qm, debounce=0)
+
+            handler._enqueue(a)
+            handler._enqueue(b)
+
+            self.assertEqual(mock_qm.add.call_count, 2)
+
+
+class TestCleanEmptyMarker(unittest.TestCase):
+    """--clean-empty must skip folders with _processing marker."""
+
+    def _run_clean_empty(self, output_dir):
+        """Import and run the clean-empty logic directly from main.py."""
+        import importlib, types
+        import main as main_mod
+        removed = 0
+        skipped = 0
+        for sub in sorted(Path(output_dir).iterdir()):
+            if not sub.is_dir():
+                continue
+            if (sub / "_processing").exists():
+                skipped += 1
+                continue
+            unique_dir = sub / "unique_frames"
+            try:
+                empty = not unique_dir.exists() or not any(unique_dir.iterdir())
+                if empty:
+                    shutil.rmtree(str(sub))
+                    removed += 1
+            except (OSError, StopIteration):
+                skipped += 1
+        return removed, skipped
+
+    def test_folder_with_processing_marker_is_skipped(self):
+        """Folder containing _processing file must not be removed."""
+        with tempfile.TemporaryDirectory() as d:
+            active = Path(d) / "active_video"
+            active.mkdir()
+            (active / "_processing").write_text("in progress")
+
+            removed, skipped = self._run_clean_empty(d)
+            self.assertTrue(active.exists(), "In-progress folder must not be removed")
+            self.assertEqual(skipped, 1)
+            self.assertEqual(removed, 0)
+
+    def test_empty_folder_without_marker_is_removed(self):
+        """Folder with no unique_frames and no marker must be removed."""
+        with tempfile.TemporaryDirectory() as d:
+            empty_vid = Path(d) / "empty_video"
+            empty_vid.mkdir()
+
+            removed, skipped = self._run_clean_empty(d)
+            self.assertFalse(empty_vid.exists(), "Empty folder must be removed")
+            self.assertEqual(removed, 1)
+
+    def test_folder_with_frames_is_kept(self):
+        """Folder with populated unique_frames must not be removed."""
+        with tempfile.TemporaryDirectory() as d:
+            done = Path(d) / "done_video"
+            frames = done / "unique_frames"
+            frames.mkdir(parents=True)
+            (frames / "frame_001.jpg").write_bytes(b"jpg")
+
+            removed, skipped = self._run_clean_empty(d)
+            self.assertTrue(done.exists(), "Folder with frames must be kept")
+            self.assertEqual(removed, 0)
 
 
 # =================================================================

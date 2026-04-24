@@ -42,8 +42,9 @@ if TYPE_CHECKING:
 # ─────────────────────────────────────────────
 
 # Codecs that FFmpeg handles well without transcoding
+# BUG-M5 FIX: removed dead "h265" entry — ffprobe reports "hevc", never "h265"
 SUPPORTED_CODECS = {
-    "h264", "h265", "hevc",
+    "h264", "hevc",
     "vp8", "vp9", "av1",
     "mpeg4", "mpeg2video",
 }
@@ -168,13 +169,17 @@ def normalize_video(
     # Build output path for normalized file
     stem       = Path(video_path).stem
     norm_name  = f"{stem}_normalized.mp4"
-    os.makedirs(work_dir, exist_ok=True)
-    norm_path  = os.path.join(work_dir, norm_name)
+    # BUG-M3 FIX: write ffmpeg output to a system temp file first, then move it
+    # into work_dir only after ffmpeg confirms success — avoids creating an empty
+    # work_dir on disk when ffmpeg fails (e.g. bad codec, permission error).
+    import tempfile
+    tmp_fd, tmp_norm_path = tempfile.mkstemp(suffix="_norm.mp4")
+    os.close(tmp_fd)
 
     print(f"[NORMALIZE] {reason}")
     size_mb = _file_size_mb(video_path)
     if size_mb:
-        print(f"[NORMALIZE] Input: {size_mb:.1f} MB — transcoding to H.264/yuv420p...")
+        print(f"[NORMALIZE] Input: {size_mb:.1f} MB - transcoding to H.264/yuv420p...")
 
     cmd = [
         "ffmpeg", "-y",
@@ -185,22 +190,42 @@ def normalize_video(
         "-crf",      "18",         # high quality, lossless enough for frame extraction
         "-c:a",      "copy",       # keep audio unchanged (not needed for extraction)
         "-loglevel", "warning",
-        norm_path,
+        tmp_norm_path,
     ]
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=norm_cfg.get("timeout", 3600),
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            os.remove(tmp_norm_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Normalization timed out after {norm_cfg.get('timeout', 3600)}s — "
+            "file may be very large or ffmpeg is stuck"
+        )
 
     if result.returncode != 0:
+        try:
+            os.remove(tmp_norm_path)
+        except OSError:
+            pass
         from error_parser import parse_ffmpeg_error, format_error
         parsed = parse_ffmpeg_error(result.stderr)
         raise RuntimeError(
             f"Normalization failed:\n{format_error(parsed)}"
         )
+
+    # Only create work_dir and move the file after ffmpeg confirms success
+    os.makedirs(work_dir, exist_ok=True)
+    norm_path = os.path.join(work_dir, norm_name)
+    shutil.move(tmp_norm_path, norm_path)
 
     out_mb = _file_size_mb(norm_path)
     print(f"[NORMALIZE] Done -> {norm_name} ({out_mb:.1f} MB)" if out_mb else

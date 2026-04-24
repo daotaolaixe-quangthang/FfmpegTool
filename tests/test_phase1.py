@@ -20,6 +20,8 @@ import sys
 import json
 import tempfile
 import unittest
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -259,6 +261,22 @@ class TestHwDetect(unittest.TestCase):
         result = resolve_encoder({"encoder": "unsupported_encoder"})
         self.assertEqual(result, "cpu")
 
+    @patch("hw_detect.probe_encoder")
+    def test_print_hw_report_is_ascii_safe(self, mock_probe):
+        """print_hw_report() should print ASCII-safe console output."""
+        mock_probe.side_effect = lambda key: key == "qsv"
+        from hw_detect import print_hw_report
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            print_hw_report()
+
+        out = buf.getvalue()
+        self.assertIn("Hardware Encoder Availability Report", out)
+        self.assertIn("Intel Quick Sync Video", out)
+        self.assertIn("Available", out)
+        self.assertNotRegex(out, r"[✓✗⚠─—]")
+
 
 # ═══════════════════════════════════════════════════════════════════
 # 3. PROBE FIRST TESTS
@@ -438,6 +456,26 @@ class TestProbeFirst(unittest.TestCase):
         ok_files, bad_results = scan_batch(["/a.mp4", "/b.mp4"], verbose=False)
         self.assertEqual(len(ok_files),    0)
         self.assertEqual(len(bad_results), 2)
+
+    @patch("probe_first.probe_video")
+    def test_scan_batch_verbose_output_is_ascii_safe(self, mock_probe):
+        """scan_batch(verbose=True) should print ASCII-safe console output."""
+        from probe_first import scan_batch, ProbeResult
+        mock_probe.side_effect = lambda path, **kw: (
+            ProbeResult(path=path, ok=True, width=1920, height=1080, fps=30.0, duration=10.0)
+            if "good" in path else
+            ProbeResult(path=path, ok=False, issues=["No video stream found"])
+        )
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            scan_batch(["/videos/good_a.mp4", "/videos/bad_b.mp4"], verbose=True)
+
+        out = buf.getvalue()
+        self.assertIn("[PROBE] Pre-flight scan - 2 file(s)", out)
+        self.assertIn("OK   good_a.mp4", out)
+        self.assertIn("BAD  bad_b.mp4", out)
+        self.assertNotRegex(out, r"[✓✗⚠─—]")
 
 
 # ═══════════════════════════════════════════════════════════════════

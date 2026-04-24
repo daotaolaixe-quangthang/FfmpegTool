@@ -1,4 +1,4 @@
-﻿"""
+"""
 probe_first.py
 ==============
 Pre-flight validation: run ffprobe on all input videos BEFORE starting
@@ -217,9 +217,9 @@ def scan_batch(
     bad_results = []
 
     if verbose:
-        sep = "─" * 62
+        sep = "-" * 62
         print(f"\n{sep}")
-        print(f"  [PROBE] Pre-flight scan — {total} file(s)")
+        print(f"  [PROBE] Pre-flight scan - {total} file(s)")
         print(sep)
 
     for i, path in enumerate(video_files, 1):
@@ -234,11 +234,11 @@ def scan_batch(
                 dur_str = f"{result.duration:.1f}s"          if result.duration is not None else "?s"
                 mb_str  = f"{result.file_size_mb}MB"         if result.file_size_mb is not None else ""
                 info    = f"{res_str} {fps_str} {dur_str} {mb_str}".strip()
-                print(f"  [{i:3d}/{total}] ✓  {name}  ({info})")
+                print(f"  [{i:3d}/{total}] OK   {name}  ({info})")
         else:
             bad_results.append(result)
             if verbose:
-                print(f"  [{i:3d}/{total}] ✗  {name}")
+                print(f"  [{i:3d}/{total}] BAD  {name}")
                 for issue in result.issues:
                     print(f"                  -> {issue}")
 

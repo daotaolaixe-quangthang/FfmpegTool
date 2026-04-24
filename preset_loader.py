@@ -29,7 +29,10 @@ from pathlib import Path
 # Presets directory sits next to this module file
 PRESETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets")
 
-# Sections that are allowed to be deep-merged from a preset
+# Sections that are allowed to be deep-merged from a preset.
+# BUG-L4 NOTE: "normalize" and "batch" are intentionally excluded — presets
+# are not expected to control normalization or batch probe settings. Add those
+# sections here only when Phase 4 presets require it.
 MERGEABLE_SECTIONS = ("extraction", "filter", "scorer", "output", "hardware")
 
 
@@ -57,8 +60,8 @@ def list_presets() -> list[dict]:
                 "name":        data.get("name", path.stem),
                 "description": data.get("description", ""),
             })
-        except Exception:
-            # Silently skip malformed preset files
+        except Exception as exc:
+            print(f"[PRESET] Warning: skipping malformed preset file '{path.name}': {exc}")
             continue
     return presets
 
@@ -93,6 +96,30 @@ def load_preset(preset_name: str) -> dict:
         raise ValueError(f"Preset '{preset_name}' has invalid JSON: {e}")
 
 
+def _merge_preset_into_cfg(base_cfg: dict, preset: dict, preset_name: str) -> dict:
+    """Merge an already-loaded preset dict into base_cfg in place."""
+    display_name = preset.get("name", preset_name)
+    description  = preset.get("description", "")
+
+    print(f"[PRESET] > {display_name}")
+    if description:
+        print(f"[PRESET]   {description}")
+
+    applied_sections = []
+    for section in MERGEABLE_SECTIONS:
+        if section in preset:
+            if section not in base_cfg:
+                base_cfg[section] = {}
+            override_keys = {k: v for k, v in preset[section].items() if not k.startswith("_")}
+            base_cfg[section].update(override_keys)
+            applied_sections.append(section)
+
+    if applied_sections:
+        print(f"[PRESET]   Applied sections: {', '.join(applied_sections)}")
+
+    return base_cfg
+
+
 def apply_preset(base_cfg: dict, preset_name: str) -> dict:
     """
     Deep-merge a preset onto base_cfg.
@@ -115,26 +142,13 @@ def apply_preset(base_cfg: dict, preset_name: str) -> dict:
         print("[PRESET] Continuing with base config.json settings.")
         return base_cfg
 
-    display_name = preset.get("name", preset_name)
-    description  = preset.get("description", "")
+    return _merge_preset_into_cfg(base_cfg, preset, preset_name)
 
-    print(f"[PRESET] > {display_name}")
-    if description:
-        print(f"[PRESET]   {description}")
 
-    applied_sections = []
-    for section in MERGEABLE_SECTIONS:
-        if section in preset:
-            if section not in base_cfg:
-                base_cfg[section] = {}
-            override_keys = {k: v for k, v in preset[section].items() if not k.startswith("_")}
-            base_cfg[section].update(override_keys)
-            applied_sections.append(section)
-
-    if applied_sections:
-        print(f"[PRESET]   Applied sections: {', '.join(applied_sections)}")
-
-    return base_cfg
+def apply_preset_strict(base_cfg: dict, preset_name: str) -> dict:
+    """Apply a preset, but raise if the preset cannot be loaded."""
+    preset = load_preset(preset_name)
+    return _merge_preset_into_cfg(base_cfg, preset, preset_name)
 
 
 def print_presets_table() -> None:

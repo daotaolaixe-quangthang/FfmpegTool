@@ -82,10 +82,18 @@ def compute_phash(image_path: str, hash_size: int = 16) -> imagehash.ImageHash:
         return imagehash.phash(img, hash_size=hash_size)
 
 
-def hamming_to_similarity(distance: int, max_distance: int = None) -> float:
-    """Convert Hamming distance to similarity ratio (0.0 = different, 1.0 = identical)."""
+def hamming_to_similarity(distance: int, max_distance: int = None,
+                          hash_size: int = 16) -> float:
+    """Convert Hamming distance to similarity ratio (0.0 = different, 1.0 = identical).
+
+    Args:
+        max_distance: Total bits in the hash. If None, derived from hash_size.
+                      BUG-M6 FIX: was hardcoded to 256 (only correct for
+                      hash_size=16). Now defaults to hash_size**2 so direct
+                      callers with non-default hash sizes get correct values.
+    """
     if max_distance is None:
-        max_distance = 256  # for hash_size=16: 16*16=256 bits
+        max_distance = hash_size * hash_size  # e.g. 16*16=256 for default size
     return 1.0 - (distance / max_distance)
 
 
@@ -178,7 +186,7 @@ def filter_duplicates_ssim(
     removed = []
 
     print(f"\n[DEDUP-SSIM] Filtering duplicates (threshold={similarity_threshold:.0%})...")
-    print(f"             Note: SSIM is slower than pHash — suitable for <500 frames")
+    print(f"             Note: SSIM is slower than pHash - suitable for <500 frames")
 
     for path in tqdm(frame_paths, desc="  SSIM check", ncols=70):
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)

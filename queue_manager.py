@@ -25,6 +25,7 @@ Usage:
 """
 
 import os
+import re as _re
 import json
 import uuid
 import threading
@@ -40,6 +41,15 @@ QUEUE_FILE = os.path.join(QUEUE_DIR, "batch_queue.json")
 
 # ── Valid states ──
 STATES = {"pending", "running", "done", "failed", "skipped"}
+
+# ── Security: maximum items the queue may hold at once (VULN-8) ──
+MAX_QUEUE_SIZE = 500
+
+# Regex to strip absolute filesystem paths from error messages (VULN-10)
+_PATH_RE = _re.compile(
+    r"[A-Za-z]:[/\\][^\s,;'\"]{3,}"   # Windows   e.g. C:\Users\...
+    r"|/[a-zA-Z0-9_./-]{8,}"           # Unix/POSIX e.g. /home/user/...
+)
 
 
 # ─────────────────────────────────────────────
@@ -95,7 +105,11 @@ class QueueManager:
         self._file   = queue_file
         self._lock   = threading.Lock()
         self._items: dict[str, QueueItem] = {}
-        self._load()
+        # BUG-L1: _load() called before the object is shared — no lock needed
+        # here, but acquire it anyway to make the discipline consistent with all
+        # other read/write paths on _items.
+        with self._lock:
+            self._load()
 
     # ── Public API ──
 
@@ -126,6 +140,11 @@ class QueueManager:
             created_at    = _now(),
         )
         with self._lock:
+            if len(self._items) >= MAX_QUEUE_SIZE:
+                raise ValueError(
+                    f"Queue is full ({MAX_QUEUE_SIZE} items). "
+                    "Complete or remove existing items before adding more."
+                )
             self._items[item_id] = item
             self._save()
         return item_id
@@ -199,29 +218,32 @@ class QueueManager:
                 self._save()
 
     def mark_failed(self, item_id: str, error: str):
-        """Mark an item as failed with an error message."""
+        """Mark an item as failed with a sanitized error message."""
+        safe_error = _sanitize_queue_error(error)
         with self._lock:
             item = self._items.get(item_id)
             if item:
                 item.status      = "failed"
                 item.finished_at = _now()
-                item.error       = error
+                item.error       = safe_error
                 self._save()
 
     def mark_skipped(self, item_id: str, reason: str):
         """Mark an item as skipped (no frames extracted, or other skip reason)."""
+        safe_reason = _sanitize_queue_error(reason)
         with self._lock:
             item = self._items.get(item_id)
             if item:
                 item.status      = "skipped"
                 item.finished_at = _now()
-                item.error       = reason
+                item.error       = safe_reason
                 self._save()
 
     def run_next(
         self,
         base_cfg: dict,
         process_video_fn: Callable[[str, str, dict, int], dict],
+        batch_index: int = 0,
     ) -> Optional[str]:
         """
         Pick the first pending item and process it synchronously.
@@ -229,6 +251,7 @@ class QueueManager:
         Args:
             base_cfg:         Base config dict (from main.py apply_defaults).
             process_video_fn: Callable matching process_video(path, output, cfg, index) -> stats.
+            batch_index:      1-based position passed to process_video for {index} naming token.
 
         Returns:
             The item ID that was processed, or None if queue is empty.
@@ -246,15 +269,25 @@ class QueueManager:
         item_id = item.id
         print(f"[QUEUE] Processing item {item_id}: {item.input}")
 
-        # Merge overrides into a copy of base_cfg
-        import copy
-        cfg = copy.deepcopy(base_cfg)
-        for section, values in item.cfg_overrides.items():
-            if isinstance(values, dict) and isinstance(cfg.get(section), dict):
-                cfg[section].update(values)
-
         try:
-            stats = process_video_fn(item.input, item.output, cfg, 0)
+            # Merge overrides into a copy of base_cfg
+            import copy
+            cfg = copy.deepcopy(base_cfg)
+
+            # BUG-C1 FIX: handle top-level string overrides (e.g. "preset") before
+            # the dict-merge loop, which only processes section-level dicts.
+            preset_name = item.cfg_overrides.get("preset", "")
+            if preset_name:
+                from preset_loader import apply_preset_strict
+                cfg = apply_preset_strict(cfg, preset_name)
+
+            for section, values in item.cfg_overrides.items():
+                if section == "preset":
+                    continue  # already handled above
+                if isinstance(values, dict) and isinstance(cfg.get(section), dict):
+                    cfg[section].update(values)
+
+            stats = process_video_fn(item.input, item.output, cfg, batch_index)
             if stats:
                 self.mark_done(item_id, stats)
                 print(f"[QUEUE] Done: {item_id}")
@@ -263,7 +296,7 @@ class QueueManager:
                 print(f"[QUEUE] Skipped: {item_id} (no frames)")
         except Exception as exc:
             self.mark_failed(item_id, str(exc))
-            print(f"[QUEUE] Failed: {item_id} — {exc}")
+            print(f"[QUEUE] Failed: {item_id} - {exc}")
 
         return item_id
 
@@ -323,6 +356,18 @@ class QueueManager:
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _sanitize_queue_error(msg: str, max_len: int = 400) -> str:
+    """
+    Strip absolute filesystem paths from an error string before persisting
+    to queue JSON and returning over the API (VULN-10).
+
+    Keeps the error readable (codec names, exit codes, etc.) while removing
+    usernames, drive letters, and internal directory layout.
+    """
+    cleaned = _PATH_RE.sub("<path>", str(msg))
+    return cleaned[:max_len]
 
 
 def print_queue_table(items: list[QueueItem]):

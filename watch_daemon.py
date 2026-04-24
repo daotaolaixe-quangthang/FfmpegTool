@@ -37,7 +37,7 @@ QUEUE_DIR  = os.path.join(TOOL_DIR, "queue")
 STATE_FILE = os.path.join(QUEUE_DIR, "watch_state.json")
 
 # ── Supported video extensions ──
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".ts", ".flv"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 # ── Debounce delay (seconds) ──
 DEBOUNCE_SECONDS = 3.0
@@ -104,6 +104,7 @@ class VideoFileHandler(FileSystemEventHandler):
         self._qm       = queue_mgr
         self._debounce = debounce
         self._pending: dict[str, threading.Timer] = {}  # path -> active timer
+        self._enqueued: set[str] = set()  # paths already enqueued this session
         self._lock = threading.Lock()
 
     def on_created(self, event):
@@ -131,8 +132,14 @@ class VideoFileHandler(FileSystemEventHandler):
         """Called after debounce: validate file is readable then enqueue."""
         with self._lock:
             self._pending.pop(path, None)
+            if path in self._enqueued:
+                # Duplicate event burst for the same path -- skip silently.
+                return
+            self._enqueued.add(path)
 
         if not os.path.isfile(path):
+            with self._lock:
+                self._enqueued.discard(path)
             return  # file disappeared before debounce finished
 
         cfg_overrides = {}
@@ -143,6 +150,8 @@ class VideoFileHandler(FileSystemEventHandler):
             item_id = self._qm.add(path, self._output, cfg_overrides=cfg_overrides)
             print(f"[WATCH] Enqueued {os.path.basename(path)} -> {item_id}")
         except Exception as exc:
+            with self._lock:
+                self._enqueued.discard(path)
             print(f"[WATCH] Failed to enqueue {path}: {exc}")
 
 
@@ -293,8 +302,14 @@ def get_daemon(queue_mgr=None) -> WatchDaemon:
     global _daemon_instance
     if _daemon_instance is None:
         _daemon_instance = WatchDaemon(queue_mgr=queue_mgr)
-    elif queue_mgr is not None and _daemon_instance._qm is None:
+    elif queue_mgr is not None:
+        # BUG-M4 FIX: always update _qm when a non-None queue_mgr is passed,
+        # even if the daemon already has one — the caller may be passing a
+        # fresh instance (e.g. after app restart). Previously the update was
+        # silently ignored if _qm was already set, causing stale references.
         _daemon_instance._qm = queue_mgr
+        if _daemon_instance._handler is not None:
+            _daemon_instance._handler._qm = queue_mgr
     return _daemon_instance
 
 

@@ -361,6 +361,40 @@ class TestDraftMode(unittest.TestCase):
         self.assertEqual(vf_value, "fps=5")
 
     @patch("extractor.subprocess.run")
+    def test_qsv_decode_inserts_hwdownload_before_cpu_filters(self, mock_run):
+        """QSV decode must download GPU frames before applying CPU vf filters."""
+        from extractor import extract_by_fps
+        mock_run.return_value = MagicMock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as d:
+            extract_by_fps(
+                "/v/clip.mp4", d, fps=5, jpeg_quality=2,
+                hwaccel_args=["-hwaccel", "qsv"], draft=False,
+            )
+
+        cmd = mock_run.call_args[0][0]
+        vf_idx = cmd.index("-vf")
+        vf_value = cmd[vf_idx + 1]
+        self.assertEqual(vf_value, "hwdownload,format=nv12,fps=5")
+
+    @patch("extractor.subprocess.run")
+    def test_qsv_draft_mode_inserts_hwdownload_before_scale_and_fps(self, mock_run):
+        """QSV draft mode must download GPU frames before scale/fps filters."""
+        from extractor import extract_by_fps
+        mock_run.return_value = MagicMock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as d:
+            extract_by_fps(
+                "/v/clip.mp4", d, fps=5, jpeg_quality=2,
+                hwaccel_args=["-hwaccel", "qsv"], draft=True,
+            )
+
+        cmd = mock_run.call_args[0][0]
+        vf_idx = cmd.index("-vf")
+        vf_value = cmd[vf_idx + 1]
+        self.assertEqual(vf_value, "hwdownload,format=nv12,scale=-2:360,fps=5")
+
+    @patch("extractor.subprocess.run")
     def test_extract_frames_passes_draft_flag(self, mock_run):
         """extract_frames() must pass cfg['draft']=True down to extract_by_fps."""
         from extractor import extract_frames
@@ -670,13 +704,16 @@ class TestQueueAPIRoutes(unittest.TestCase):
         self._tmpdir = _tempfile.mkdtemp()
         from queue_manager import QueueManager
         self._orig_qm = flask_app.QUEUE_MGR
+        self._orig_queue_runner_thread = flask_app.QUEUE_RUNNER_THREAD
         flask_app.QUEUE_MGR = QueueManager(
             queue_file=os.path.join(self._tmpdir, "q.json")
         )
+        flask_app.QUEUE_RUNNER_THREAD = None
         self._app_module = flask_app
 
     def tearDown(self):
         self._app_module.QUEUE_MGR = self._orig_qm
+        self._app_module.QUEUE_RUNNER_THREAD = self._orig_queue_runner_thread
         import shutil
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
@@ -757,6 +794,123 @@ class TestQueueAPIRoutes(unittest.TestCase):
         """DELETE /api/queue/<unknown_id> must return 404."""
         response = self.client.delete("/api/queue/deadbeef")
         self.assertEqual(response.status_code, 404)
+
+    def test_queue_run_rejects_second_runner_while_first_is_active(self):
+        """POST /api/queue/run must not spawn a second runner while one is alive."""
+        self.client.post("/api/queue/add", json={"input": "/v/clip.mp4", "output": "/out"})
+
+        # Inject a fake alive thread directly into the module-level guard variable
+        fake_alive_thread = MagicMock()
+        fake_alive_thread.is_alive.return_value = True
+        self._app_module.QUEUE_RUNNER_THREAD = fake_alive_thread
+
+        response = self.client.post("/api/queue/run")
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertFalse(data["started"])
+        self.assertIn("already active", data["message"])
+
+    @patch("hw_detect.get_ffmpeg_hwaccel_args")
+    @patch("hw_detect.resolve_encoder")
+    @patch("main.process_video")
+    @patch("main.load_config")
+    @patch("main.apply_defaults")
+    def test_queue_run_honors_disabled_hwaccel_like_cli(
+        self,
+        mock_apply_defaults,
+        mock_load_config,
+        mock_process_video,
+        mock_resolve_encoder,
+        mock_get_hwargs,
+    ):
+        """Queue web runner must mirror CLI: when enable_hwaccel=False, use cpu/[] args."""
+        self.client.post("/api/queue/add", json={"input": "/v/clip.mp4", "output": "/out"})
+
+        cfg = {
+            "extraction": {},
+            "filter": {},
+            "scorer": {},
+            "output": {},
+            "hardware": {"encoder": "auto", "enable_hwaccel": False},
+            "batch": {},
+            "normalize": {},
+        }
+        mock_load_config.return_value = {}
+        mock_apply_defaults.return_value = cfg
+        mock_resolve_encoder.return_value = "qsv"
+        mock_get_hwargs.return_value = ["-hwaccel", "qsv"]
+
+        captured = {}
+
+        # Mock run_next to capture the cfg it receives and drain the queue.
+        # IMPORTANT: must mark item done so pending_count() drops to 0
+        # and the while-loop in _run_queue() terminates.
+        real_qm = self._app_module.QUEUE_MGR
+
+        def fake_run_next(base_cfg, process_video_fn, batch_index=0):
+            captured["cfg"] = base_cfg
+            captured["process_video_fn"] = process_video_fn
+            captured["batch_index"] = batch_index
+            # drain the queue so the caller loop exits
+            for item in real_qm.list_items():
+                if item.status == "pending":
+                    real_qm.mark_running(item.id)
+                    real_qm.mark_done(item.id, stats={})
+            return None
+
+        real_qm.run_next = MagicMock(side_effect=fake_run_next)
+
+        response = self.client.post("/api/queue/run")
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertTrue(data["started"])
+
+        # Wait for the daemon thread to finish (it drained the queue synchronously
+        # in fake_run_next, so QUEUE_RUNNER_THREAD should become None quickly)
+        import time
+        for _ in range(20):
+            if self._app_module.QUEUE_RUNNER_THREAD is None:
+                break
+            time.sleep(0.05)
+
+        self.assertIn("_resolved_key", captured.get("cfg", {}).get("hardware", {}),
+                      "hw resolution keys must be injected before run_next")
+        self.assertEqual(captured["cfg"]["hardware"]["_resolved_key"], "cpu")
+        self.assertEqual(captured["cfg"]["extraction"]["_hwaccel_args"], [])
+        self.assertIs(captured["process_video_fn"], mock_process_video)
+        self.assertEqual(captured["batch_index"], 1)
+        mock_resolve_encoder.assert_not_called()
+        mock_get_hwargs.assert_not_called()
+
+    def test_queue_run_marks_item_failed_when_preset_missing(self):
+        """Queue execution must fail the item when its queued preset no longer exists."""
+        add_resp = self.client.post(
+            "/api/queue/add",
+            json={
+                "input": "/v/clip.mp4",
+                "output": "/out",
+                "cfg_overrides": {"preset": "missing_preset"},
+            },
+        )
+        item_id = json.loads(add_resp.data)["id"]
+
+        base_cfg = {
+            "extraction": {},
+            "filter": {},
+            "scorer": {},
+            "output": {},
+            "hardware": {},
+            "batch": {},
+            "normalize": {},
+        }
+
+        processed = self._app_module.QUEUE_MGR.run_next(base_cfg, MagicMock())
+        self.assertEqual(processed, item_id)
+
+        item = self._app_module.QUEUE_MGR.get(item_id)
+        self.assertEqual(item.status, "failed")
+        self.assertIn("Preset not found", item.error)
+        self.assertIn("missing_preset", item.error)
 
 
 # ═══════════════════════════════════════════════════════════════════
