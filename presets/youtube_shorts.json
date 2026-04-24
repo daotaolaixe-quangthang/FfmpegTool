@@ -1,0 +1,32 @@
+{
+  "_comment": "YouTube Shorts Pack — 9:16 landscape-to-vertical, balanced quality",
+  "name": "YouTube Shorts Pack",
+  "description": "FPS extraction at 2fps, generous blur threshold, top-30 frames.",
+
+  "extraction": {
+    "mode": "fps",
+    "fps": 2,
+    "jpeg_quality": 4
+  },
+
+  "filter": {
+    "blur_threshold": 60.0,
+    "similarity_threshold": 0.68,
+    "dedup_method": "phash",
+    "phash_size": 16
+  },
+
+  "scorer": {
+    "enabled": true,
+    "top_n": 30,
+    "save_score_report": true
+  },
+
+  "output": {
+    "naming_pattern": "{video_name}",
+    "generate_html_preview": true,
+    "preview_columns": 5,
+    "report_json": true,
+    "keep_raw": false
+  }
+}

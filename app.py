@@ -23,6 +23,7 @@ import threading
 import subprocess
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, Response, send_from_directory
+from preset_loader import list_presets
 
 # ── Ensure FfmpegTool dir is in path ──
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,8 +42,17 @@ JOBS_LOCK = threading.Lock()  # Protect all mutations of JOBS dict
 # ─────────────────────────────────────────────
 
 def build_command(data: dict) -> list[str]:
-    """Build the main.py CLI command from UI form data."""
+    """Build the main.py CLI command from UI form data.
+
+    Phase 1 additions:
+      data["preset"]   (str)  — preset name from presets/ folder, e.g. "tiktok_pack"
+      data["no_probe"] (bool) — skip pre-flight ffprobe scan in batch mode
+    """
     cmd = [sys.executable, os.path.join(TOOL_DIR, "main.py")]
+
+    # ── Phase 1: Preset (applied first so explicit params override it) ──
+    if data.get("preset", "").strip():
+        cmd += ["--preset", data["preset"].strip()]
 
     # Input source
     if data.get("url", "").strip():
@@ -73,6 +83,8 @@ def build_command(data: dict) -> list[str]:
         cmd += ["--keep-raw"]
     if data.get("no_html"):
         cmd += ["--no-html"]
+    if data.get("no_probe"):
+        cmd += ["--no-probe"]
 
     return cmd
 
@@ -306,6 +318,20 @@ def _is_tqdm_line(line: str) -> bool:
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/api/presets")
+def api_presets():
+    """
+    Return list of available presets for the UI dropdown.
+
+    Response: [{"file": "tiktok_pack", "name": "TikTok Pack", "description": "..."}]
+    """
+    try:
+        presets = list_presets()
+        return jsonify({"presets": presets})
+    except Exception as e:
+        return jsonify({"error": str(e), "presets": []}), 500
 
 
 @app.route("/api/run", methods=["POST"])

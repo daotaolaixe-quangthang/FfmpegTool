@@ -1,8 +1,45 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(git -C \"E:/2WEBApp/AI-OS\" status --short -- \"skills/video-multimodal-package\")",
+      "Bash(git -C \"E:/2WEBApp/AI-OS\" diff HEAD -- \"skills/video-multimodal-package\")",
+      "Bash(git -C \"E:/2WEBApp/AI-OS\" diff --no-index -- /dev/null \"skills/video-multimodal-package\")",
+      "Bash(python -c \"import tempfile; print\\(tempfile.mkdtemp\\(prefix='aios-empty-'\\)\\)\")",
+      "Bash(git -C \"E:/2WEBApp/AI-OS\" diff --no-index -- \"C:/Users/Admin/AppData/Local/Temp/aios-empty-txcrp2j5\" \"E:/2WEBApp/AI-OS/skills/video-multimodal-package\")",
+      "Bash(python -m py_compile \"E:/2WEBApp/AI-OS/skills/video-multimodal-package/scripts/package_video.py\" \"E:/2WEBApp/AI-OS/skills/video-multimodal-package/scripts/transcribe_audio.py\" \"E:/2WEBApp/AI-OS/skills/video-multimodal-package/scripts/merge_timeline.py\" \"E:/2WEBApp/AI-OS/skills/video-multimodal-package/scripts/extract_audio.py\")",
+      "Bash(python \"E:/2WEBApp/AI-OS/skills/video-multimodal-package/tests/smoke.py\")",
+      "Bash(python \"E:/2WEBApp/AI-OS/tooling/validate-skill.py\" \"E:/2WEBApp/AI-OS/skills/video-multimodal-package\")",
+      "Bash(git -C \"E:/2WEBApp/AI-OS\" diff -- \"skills/video-multimodal-package\")",
+      "Bash(python -c \"import tempfile; print\\(tempfile.gettempdir\\(\\)\\)\")",
+      "Bash(python -c \"import tempfile, pathlib; p=pathlib.Path\\(tempfile.mkdtemp\\(prefix='aios-empty-'\\)\\); print\\(p\\)\")",
+      "Bash(git diff *)",
+      "Bash(python -c \"from pathlib import Path; p=Path\\(r'C:/Users/Admin/AppData/Local/Temp/video-multimodal-package.diff'\\); print\\(p\\); print\\(p.stat\\(\\).st_size\\)\")",
+      "WebSearch",
+      "Bash(python \"E:/2WEBApp/AI-OS/tooling/security-scan.py\" \"E:/2WEBApp/AI-OS/skills/video-multimodal-package\")",
+      "Bash(python \"E:/2WEBApp/AI-OS/tooling/run-evals.py\" \"E:/2WEBApp/AI-OS/skills/video-multimodal-package\")",
+      "Bash(python \"E:/2WEBApp/AI-OS/skills/video-multimodal-package/scripts/package_video.py\" --input \"C:/Users/Admin/AppData/Local/Temp/ffmpegtool_smoke.mp4\" --mode balanced --output \"C:/Users/Admin/AppData/Local/Temp/video_multimodal_pkg_e2e\" --json)",
+      "Read(//c/Users/Admin/AppData/Local/Temp/video_multimodal_pkg_e2e/ffmpegtool_smoke/**)",
+      "Read(//c/Users/Admin/AppData/Local/Temp/video_multimodal_pkg_e2e/ffmpegtool_smoke/frames/**)",
+      "Read(//c/Users/Admin/AppData/Local/Temp/video_multimodal_pkg_e2e/ffmpegtool_smoke/artifacts/**)",
+      "Bash(python \"E:/2WEBApp/AI-OS/skills/video-multimodal-package/scripts/package_video.py\" --input \"C:/Users/Admin/AppData/Local/Temp/ffmpegtool_smoke.mp4\" --mode fast --output \"C:/Users/Admin/AppData/Local/Temp/video_multimodal_pkg_e2e\" --json)",
+      "Bash(git -C \"E:/2WEBApp/AI-OS\" status --short)",
+      "Bash(python \"E:/2WEBApp/AI-OS/tooling/skill-registry.py\" generate)",
+      "Bash(git -C \"E:/2WEBApp/AI-OS\" diff -- README.md tooling/skill-registry.py tooling/generate-index.py registry/skills-index.json registry/skills-index.yaml registry/tags-index.json registry/tags-index.yaml skills/video-multimodal-package/manifest.yaml skills/video-multimodal-package/SKILL.md skills/video-multimodal-package/README.md skills/video-multimodal-package/CHANGELOG.md)",
+      "Bash(python \"E:/2WEBApp/AI-OS/tooling/skill-registry.py\" list --status stable)",
+      "Bash(python \"E:/2WEBApp/AI-OS/tooling/skill-registry.py\" info video-multimodal-package)",
+      "Bash(python \"E:/2WEBApp/AI-OS/skills/video-multimodal-package/scripts/package_video.py\" --input \"G:/Pictures/Camera Roll/story1/3381beb1-2576-4570-bb24-e578b9ae2072.mp4\" --output \"C:/Users/Admin/AppData/Local/Temp/video_multimodal_pkg_e2e_speech\" --mode balanced --backend faster-whisper --json)",
+      "Bash(python -c \"import faster_whisper; print\\('faster-whisper OK'\\)\")",
+      "Bash(ffprobe -v error -show_streams -select_streams a -of json \"G:/Pictures/Camera Roll/story1/3381beb1-2576-4570-bb24-e578b9ae2072.mp4\")",
+      "Bash(python -m pip --version)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(nvidia-smi)",
+      "Bash(py -0p)",
+      "Bash(python -m pip install --dry-run faster-whisper)",
+      "Bash(python -m pip install --dry-run ctranslate2)",
+      "Bash(python -m pip install faster-whisper)"
+    ],
+    "deny": [],
     "defaultMode": "bypassPermissions",
-    "skipDangerousModePermissionPrompt": true,
-    "allow": [],
-    "deny": []
+    "skipDangerousModePermissionPrompt": true
   }
 }

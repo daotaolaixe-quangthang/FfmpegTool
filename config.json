@@ -1,5 +1,5 @@
 {
-  "_comment": "FfmpegTool default config — edit freely",
+  "_comment": "FfmpegTool default config — edit freely. CLI args override these values.",
 
   "extraction": {
     "fps": 5,
@@ -7,7 +7,7 @@
     "_mode_options": ["fps", "scene"],
     "scene_threshold": 27.0,
     "jpeg_quality": 2,
-    "_jpeg_quality_note": "1=best quality/largest files, 31=worst/smallest. Value 2 = near-lossless (large temp files). Recommended: 5-8 for balanced quality/speed"
+    "_jpeg_quality_note": "1=best quality/largest files, 31=worst/smallest. Value 2 = near-lossless. Recommended: 5-8 for balanced quality/speed"
   },
 
   "filter": {
@@ -19,7 +19,7 @@
     "_dedup_method_options": ["phash", "ssim"],
     "_dedup_method_note": "phash=fast (recommended), ssim=slower but more accurate (use for <500 frames)",
     "phash_size": 16,
-    "_phash_size_note": "pHash grid size. Higher = more precise but slower. Valid range: 8-32. At hash_size=16, hash is 256 bits and max Hamming distance is 256"
+    "_phash_size_note": "pHash grid size. Higher = more precise but slower. Valid range: 8-32"
   },
 
   "scorer": {
@@ -34,6 +34,27 @@
     "keep_raw": false,
     "generate_html_preview": true,
     "preview_columns": 5,
-    "report_json": true
+    "report_json": true,
+    "naming_pattern": "{video_name}",
+    "_naming_pattern_note": "Output folder name pattern. Tokens: {video_name} {index} {campaign} {lang} {ratio} {date}",
+    "campaign": "",
+    "_campaign_note": "Used in naming_pattern as {campaign}",
+    "lang": "",
+    "_lang_note": "Used in naming_pattern as {lang}",
+    "ratio": "",
+    "_ratio_note": "Used in naming_pattern as {ratio}, e.g. '9x16' or '16x9'"
+  },
+
+  "hardware": {
+    "encoder": "auto",
+    "_encoder_options": ["auto", "nvenc", "qsv", "amf", "cpu"],
+    "_encoder_note": "auto = detect best available. nvenc=NVIDIA, qsv=Intel, amf=AMD, cpu=x264 fallback",
+    "enable_hwaccel": true,
+    "_enable_hwaccel_note": "Set false to always use CPU (useful for debugging or if hwaccel causes issues)"
+  },
+
+  "batch": {
+    "probe_before_run": true,
+    "_probe_note": "Run ffprobe pre-flight scan on all videos before batch starts. Detects bad files early."
   }
 }

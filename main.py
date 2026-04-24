@@ -1,4 +1,4 @@
-"""
+﻿"""
 main.py
 =======
 FfmpegTool — Video Frame Extractor & Smart Filter
@@ -12,9 +12,22 @@ Full pipeline:
   5. [Optional] Score frames aesthetically and select top-N
   6. Generate JSON report + HTML visual preview gallery
 
+Phase 1 additions:
+  --preset NAME     Load a named preset from presets/ folder
+  --list-presets    Show all available presets and exit
+  --no-probe        Skip pre-flight ffprobe scan (batch mode)
+  Hardware acceleration auto-detected from config hardware.encoder
+  Output naming pattern: config output.naming_pattern
+
 Usage:
   # Single video (local file)
   python main.py --input "G:/Videos/clip.mp4" --output "G:/Frames"
+
+  # With preset
+  python main.py --input clip.mp4 --output G:/Frames --preset tiktok_pack
+
+  # List available presets
+  python main.py --list-presets
 
   # From TikTok / YouTube URL
   python main.py --url "https://www.tiktok.com/..." --output "G:/Frames"
@@ -36,6 +49,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import json
 import shutil
@@ -48,6 +62,9 @@ from filters import run_filter_pipeline
 from reporter import save_json_report, save_html_preview, save_batch_html_preview, print_summary
 from downloader import download_video
 from scorer import score_all_frames, select_top_n, save_score_report, print_top_scores
+from preset_loader import apply_preset, print_presets_table, list_presets
+from hw_detect import resolve_encoder, get_ffmpeg_hwaccel_args
+from probe_first import scan_batch
 
 
 # ─────────────────────────────────────────────
@@ -74,6 +91,8 @@ def apply_defaults(cfg: dict) -> dict:
     cfg.setdefault("filter", {})
     cfg.setdefault("scorer", {})
     cfg.setdefault("output", {})
+    cfg.setdefault("hardware", {})
+    cfg.setdefault("batch", {})
 
     e = cfg["extraction"]
     e.setdefault("mode", "fps")
@@ -97,15 +116,71 @@ def apply_defaults(cfg: dict) -> dict:
     o.setdefault("generate_html_preview", True)
     o.setdefault("preview_columns", 5)
     o.setdefault("report_json", True)
+    o.setdefault("naming_pattern", "{video_name}")
+    o.setdefault("campaign", "")
+    o.setdefault("lang", "")
+    o.setdefault("ratio", "")
+
+    h = cfg["hardware"]
+    h.setdefault("encoder", "auto")
+    h.setdefault("enable_hwaccel", True)
+
+    b = cfg["batch"]
+    b.setdefault("probe_before_run", True)
 
     return cfg
+
+
+# ─────────────────────────────────────────────
+# Output naming resolution  (Phase 1)
+# ─────────────────────────────────────────────
+
+def resolve_video_output_name(
+    video_path: str,
+    cfg: dict,
+    batch_index: int = 0,
+) -> str:
+    """
+    Resolve the output folder name for a single video.
+
+    Supports these tokens in cfg["output"]["naming_pattern"]:
+        {video_name}  — original filename stem   (e.g. "clip")
+        {index}       — zero-padded batch index  (e.g. "003")
+        {campaign}    — cfg["output"]["campaign"] (e.g. "summer_sale")
+        {lang}        — cfg["output"]["lang"]     (e.g. "vi")
+        {ratio}       — cfg["output"]["ratio"]    (e.g. "9x16")
+        {date}        — current date              (e.g. "20260423")
+
+    Default pattern is '{video_name}', which preserves the original behavior.
+    """
+    pattern    = cfg["output"].get("naming_pattern", "{video_name}")
+    video_name = Path(video_path).stem
+
+    tokens = {
+        "{video_name}": video_name,
+        "{index}":      f"{batch_index:03d}",
+        "{campaign}":   cfg["output"].get("campaign", ""),
+        "{lang}":       cfg["output"].get("lang",     ""),
+        "{ratio}":      cfg["output"].get("ratio",    ""),
+        "{date}":       datetime.now().strftime("%Y%m%d"),
+    }
+
+    result = pattern
+    for token, value in tokens.items():
+        result = result.replace(token, value)
+
+    # Collapse multiple underscores/hyphens, strip leading/trailing separators
+    result = re.sub(r"[_\-]{2,}", "_", result).strip("_- ")
+
+    # Fallback to original stem if pattern resolves to empty string
+    return result or video_name
 
 
 # ─────────────────────────────────────────────
 # Single video pipeline
 # ─────────────────────────────────────────────
 
-def process_video(video_path: str, output_dir: str, cfg: dict) -> dict:
+def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int = 0) -> dict:
     """
     Full pipeline for a single video:
       1. Extract frames (raw)
@@ -114,11 +189,11 @@ def process_video(video_path: str, output_dir: str, cfg: dict) -> dict:
       4. [Optional] Score + select top-N aesthetically best frames
       5. Generate report + HTML preview
     """
-    video_name = Path(video_path).stem
+    video_name       = resolve_video_output_name(video_path, cfg, batch_index)
     video_output_dir = os.path.join(output_dir, video_name)
-    raw_dir = os.path.join(video_output_dir, "_raw")
-    unique_dir = os.path.join(video_output_dir, "unique_frames")
-    top_frames_dir = os.path.join(video_output_dir, "top_frames")
+    raw_dir          = os.path.join(video_output_dir, "_raw")
+    unique_dir       = os.path.join(video_output_dir, "unique_frames")
+    top_frames_dir   = os.path.join(video_output_dir, "top_frames")
 
     for transient_dir in (raw_dir, unique_dir, top_frames_dir):
         shutil.rmtree(transient_dir, ignore_errors=True)
@@ -212,15 +287,36 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
     total = len(video_files)
     print(f"[BATCH] Found {total} videos in: {input_folder}")
 
-    # Per-video result tracking
+    # ── Phase 0: Pre-flight probe scan ──
+    preflight_skipped: list[dict] = []
+    if cfg.get("batch", {}).get("probe_before_run", True):
+        video_files, bad_results = scan_batch(video_files)
+        for bad in bad_results:
+            preflight_skipped.append({
+                "index":               None,
+                "video_name":          Path(bad.path).name,
+                "status":              "skipped",
+                "total_raw_frames":    0,
+                "removed_blurry":      0,
+                "removed_duplicate":   0,
+                "final_unique_frames": 0,
+                "top_n_selected":      None,
+                "output_folder":       "",
+                "error":               " | ".join(bad.issues),
+            })
+        if not video_files:
+            print("[BATCH] No valid video files to process after pre-flight scan. Aborting.")
+            return
+
+    # ── Per-video result tracking ──
     video_results: list[dict] = []
     success_count, skipped_count, error_count = 0, 0, 0
 
     for i, video_path in enumerate(video_files, 1):
         fname = os.path.basename(video_path)
-        print(f"\n[BATCH] {i}/{total}: {fname}")
+        print(f"\n[BATCH] {i}/{len(video_files)}: {fname}")
         try:
-            stats = process_video(video_path, output_dir, cfg)
+            stats = process_video(video_path, output_dir, cfg, batch_index=i)
             if stats:  # process_video returns {} on 0 frames
                 success_count += 1
                 video_results.append({
@@ -266,8 +362,12 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
                 "error":               error_msg,
             })
 
+    # Merge preflight-skipped entries into video_results for reporting
+    all_results = preflight_skipped + video_results
+    skipped_count += len(preflight_skipped)
+
     print(f"\n[BATCH] Done. Success: {success_count} | Skipped: {skipped_count} | Errors: {error_count}")
-    non_success_names = [v["video_name"] for v in video_results if v["status"] != "success"]
+    non_success_names = [v["video_name"] for v in all_results if v["status"] != "success"]
     if non_success_names:
         print(f"[BATCH] Non-success files: {', '.join(non_success_names)}")
 
@@ -282,7 +382,7 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
         "input_folder":      input_folder,
         "output_folder":     output_dir,
         "generated_at":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "video_results":     video_results,
+        "video_results":     all_results,
     }
     summary_path = os.path.join(output_dir, "_batch_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -304,7 +404,7 @@ def process_batch(input_folder: str, output_dir: str, cfg: dict):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="FfmpegTool",
-        description="Smart video frame extractor: extract → blur filter → dedup → score",
+        description="Smart video frame extractor: extract -> blur filter -> dedup -> score",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -330,6 +430,13 @@ Examples:
     python main.py --batch "G:/Videos/" --output "G:/Frames"
         """
     )
+
+    # ── Preset (Phase 1) ──
+    parser.add_argument("--preset", "-p",
+                        metavar="NAME",
+                        help="Load a named preset from presets/ folder (e.g. tiktok_pack)")
+    parser.add_argument("--list-presets", action="store_true",
+                        help="Show all available presets and exit")
 
     # ── Input source ──
     src = parser.add_mutually_exclusive_group()
@@ -371,11 +478,15 @@ Examples:
                         help="Skip HTML preview generation")
     parser.add_argument("--no-report", action="store_true",
                         help="Skip JSON report generation")
+    parser.add_argument("--no-probe", action="store_true",
+                        help="Skip pre-flight ffprobe scan in batch mode")
     parser.add_argument("--gen-batch-html", action="store_true",
                         help="(Re)generate master batch HTML from an existing --output folder. "
                              "No video processing — scans unique_frames/ in existing subfolders only.")
     parser.add_argument("--clean-empty", action="store_true",
                         help="Remove empty output subfolders (no unique_frames/) from --output dir.")
+    parser.add_argument("--hw-report", action="store_true",
+                        help="Print hardware encoder availability report and exit")
 
     return parser
 
@@ -417,6 +528,8 @@ def apply_cli_overrides(cfg: dict, args) -> dict:
         cfg["output"]["generate_html_preview"] = False
     if args.no_report:
         cfg["output"]["report_json"] = False
+    if args.no_probe:
+        cfg["batch"]["probe_before_run"] = False
     return cfg
 
 
@@ -428,8 +541,33 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    # ── Standalone: list presets ──
+    if args.list_presets:
+        print_presets_table()
+        sys.exit(0)
+
+    # ── Standalone: hardware report ──
+    if args.hw_report:
+        from hw_detect import print_hw_report
+        print_hw_report()
+        sys.exit(0)
+
     cfg = apply_defaults(load_config("config.json"))
+
+    # ── Apply preset BEFORE CLI overrides (CLI wins over preset) ──
+    if args.preset:
+        cfg = apply_preset(cfg, args.preset)
+
     cfg = apply_cli_overrides(cfg, args)
+
+    # ── Resolve hardware encoder and inject hwaccel args ──
+    if cfg["hardware"].get("enable_hwaccel", True):
+        hw_key = resolve_encoder(cfg["hardware"])
+        cfg["hardware"]["_resolved_key"] = hw_key
+        cfg["extraction"]["_hwaccel_args"] = get_ffmpeg_hwaccel_args(hw_key)
+    else:
+        cfg["hardware"]["_resolved_key"]   = "cpu"
+        cfg["extraction"]["_hwaccel_args"] = []
 
     input_sources = [args.input, args.url, args.batch]
     input_source_count = sum(1 for value in input_sources if value)
@@ -528,3 +666,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

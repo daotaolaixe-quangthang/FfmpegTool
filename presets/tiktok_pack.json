@@ -1,0 +1,32 @@
+{
+  "_comment": "TikTok Pack — Optimized for short-form vertical video (9:16)",
+  "name": "TikTok Pack",
+  "description": "Scene extraction, tight dedup, aesthetic scoring. Best for 15–60s clips.",
+
+  "extraction": {
+    "mode": "scene",
+    "scene_threshold": 20.0,
+    "jpeg_quality": 5
+  },
+
+  "filter": {
+    "blur_threshold": 70.0,
+    "similarity_threshold": 0.75,
+    "dedup_method": "phash",
+    "phash_size": 16
+  },
+
+  "scorer": {
+    "enabled": true,
+    "top_n": 20,
+    "save_score_report": true
+  },
+
+  "output": {
+    "naming_pattern": "{video_name}",
+    "generate_html_preview": true,
+    "preview_columns": 4,
+    "report_json": true,
+    "keep_raw": false
+  }
+}

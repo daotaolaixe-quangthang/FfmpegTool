@@ -1,0 +1,30 @@
+{
+  "_comment": "Draft Preview — Fast low-quality render for layout check. Use BEFORE full render.",
+  "name": "Draft Preview",
+  "description": "1fps, low quality JPEG, no scorer. Render in seconds to verify layout.",
+
+  "extraction": {
+    "mode": "fps",
+    "fps": 1,
+    "jpeg_quality": 15
+  },
+
+  "filter": {
+    "blur_threshold": 40.0,
+    "similarity_threshold": 0.60,
+    "dedup_method": "phash",
+    "phash_size": 8
+  },
+
+  "scorer": {
+    "enabled": false
+  },
+
+  "output": {
+    "naming_pattern": "{video_name}_DRAFT",
+    "generate_html_preview": true,
+    "preview_columns": 5,
+    "report_json": false,
+    "keep_raw": false
+  }
+}
