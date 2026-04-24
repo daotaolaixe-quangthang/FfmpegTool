@@ -48,6 +48,10 @@ _batch_summary.json
 report.json
 score_report.json
 
+# Phase 2: Queue persistence (local state only)
+queue/batch_queue.json
+queue/batch_queue.json.tmp
+
 # Common local output/download folders
 output/
 outputs/

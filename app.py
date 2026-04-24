@@ -24,6 +24,7 @@ import subprocess
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, Response, send_from_directory
 from preset_loader import list_presets
+from queue_manager import QueueManager
 
 # ── Ensure FfmpegTool dir is in path ──
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +36,9 @@ app = Flask(__name__, template_folder=os.path.join(TOOL_DIR, "templates"))
 # job_id -> {"queue": Queue, "status": str, "stats": dict}
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()  # Protect all mutations of JOBS dict
+
+# ── Persistent batch queue (Phase 2) ──
+QUEUE_MGR = QueueManager()
 
 
 # ─────────────────────────────────────────────
@@ -85,6 +89,10 @@ def build_command(data: dict) -> list[str]:
         cmd += ["--no-html"]
     if data.get("no_probe"):
         cmd += ["--no-probe"]
+    if data.get("draft"):
+        cmd += ["--draft"]
+    if data.get("no_normalize"):
+        cmd += ["--no-normalize"]
 
     return cmd
 
@@ -599,6 +607,112 @@ def api_serve_preview_asset(job_id: str, asset_path: str):
         return "Preview asset not found.", 404
 
     return send_from_directory(str(preview_root), asset_path)
+
+
+# ──────────────────────────────────────────────
+# Phase 2: Queue API routes
+# ──────────────────────────────────────────────
+
+@app.route("/api/queue/add", methods=["POST"])
+def api_queue_add():
+    """
+    Add a job to the persistent queue.
+
+    Body JSON: {"input": str, "output": str, "cfg_overrides": dict (optional)}
+    Response:  {"id": str, "status": "pending"}
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data"}), 400
+    input_path  = (data.get("input") or "").strip()
+    output_path = (data.get("output") or "").strip()
+    if not input_path:
+        return jsonify({"error": "input is required"}), 400
+    if not output_path:
+        return jsonify({"error": "output is required"}), 400
+    item_id = QUEUE_MGR.add(
+        input_path,
+        output_path,
+        cfg_overrides=data.get("cfg_overrides", {}),
+    )
+    return jsonify({"id": item_id, "status": "pending"}), 200
+
+
+@app.route("/api/queue", methods=["GET"])
+def api_queue_list():
+    """
+    Return all queue items.
+
+    Response: {"items": [...], "summary": {pending: N, ...}}
+    """
+    items   = QUEUE_MGR.list_items()
+    summary = QUEUE_MGR.summary()
+    return jsonify({
+        "items":   [i.to_dict() for i in items],
+        "summary": summary,
+    })
+
+
+@app.route("/api/queue/retry/<item_id>", methods=["POST"])
+def api_queue_retry(item_id: str):
+    """
+    Retry a failed/skipped queue item.
+
+    Response: {"id": str, "status": "pending"}
+    """
+    try:
+        item = QUEUE_MGR.retry(item_id)
+        return jsonify({"id": item.id, "status": item.status})
+    except KeyError:
+        return jsonify({"error": f"Item not found: {item_id}"}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/queue/<item_id>", methods=["DELETE"])
+def api_queue_remove(item_id: str):
+    """
+    Remove a pending/failed queue item.
+
+    Response: {"ok": true} or 404/400
+    """
+    try:
+        removed = QUEUE_MGR.remove(item_id)
+        if removed:
+            return jsonify({"ok": True})
+        return jsonify({"error": f"Item not found: {item_id}"}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/queue/run", methods=["POST"])
+def api_queue_run():
+    """
+    Trigger background processing of all pending queue items.
+
+    Runs queue in a daemon thread so the API returns immediately.
+    Response: {"started": true, "pending": N}
+    """
+    pending = QUEUE_MGR.pending_count()
+    if pending == 0:
+        return jsonify({"started": False, "message": "No pending items", "pending": 0})
+
+    def _run_queue():
+        import sys
+        import os
+        sys.path.insert(0, TOOL_DIR)
+        from main import apply_defaults, load_config
+        from hw_detect import resolve_encoder, get_ffmpeg_hwaccel_args
+        from main import process_video
+        cfg = apply_defaults(load_config("config.json"))
+        hw_key = resolve_encoder(cfg["hardware"])
+        cfg["extraction"]["_hwaccel_args"] = get_ffmpeg_hwaccel_args(hw_key)
+        while QUEUE_MGR.pending_count() > 0:
+            QUEUE_MGR.run_next(cfg, process_video)
+
+    t = threading.Thread(target=_run_queue, daemon=True)
+    t.start()
+    return jsonify({"started": True, "pending": pending})
 
 
 # ─────────────────────────────────────────────

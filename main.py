@@ -1,4 +1,4 @@
-﻿"""
+"""
 main.py
 =======
 FfmpegTool — Video Frame Extractor & Smart Filter
@@ -65,6 +65,8 @@ from scorer import score_all_frames, select_top_n, save_score_report, print_top_
 from preset_loader import apply_preset, print_presets_table, list_presets
 from hw_detect import resolve_encoder, get_ffmpeg_hwaccel_args
 from probe_first import scan_batch
+from queue_manager import QueueManager, QueueItem, print_queue_table
+from normalizer import normalize_video
 
 
 # ─────────────────────────────────────────────
@@ -127,6 +129,9 @@ def apply_defaults(cfg: dict) -> dict:
 
     b = cfg["batch"]
     b.setdefault("probe_before_run", True)
+
+    n = cfg.setdefault("normalize", {})
+    n.setdefault("enabled", True)
 
     return cfg
 
@@ -203,6 +208,17 @@ def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int 
     print(f"  Processing: {video_name}")
     print(sep)
 
+    # ── Step 0 (Phase 2): Auto-normalize input codec/pix_fmt ──
+    norm_result = None
+    if cfg.get("normalize", {}).get("enabled", True):
+        from probe_first import probe_video
+        probe = probe_video(video_path)
+        # Only normalize if probe succeeded; broken files fail gracefully at step 1
+        if probe.ok:
+            norm_result = normalize_video(video_path, video_output_dir, cfg, probe=probe)
+            if norm_result.was_transcoded:
+                video_path = norm_result.path  # use normalized file for extraction
+
     # ── Step 1: Extract ──
     raw_frames = extract_frames(video_path, raw_dir, cfg["extraction"])
 
@@ -251,6 +267,9 @@ def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int 
         # raw frames accumulate on disk silently on error.
         if not cfg["output"].get("keep_raw", False):
             shutil.rmtree(raw_dir, ignore_errors=True)
+        # Phase 2: clean up normalized temp file after pipeline completes
+        if norm_result and norm_result.was_transcoded:
+            norm_result.cleanup()
 
     # ── Step 6: Reports ──
     if cfg["output"].get("report_json", True):
@@ -488,6 +507,24 @@ Examples:
     parser.add_argument("--hw-report", action="store_true",
                         help="Print hardware encoder availability report and exit")
 
+    # ── Phase 2: Draft mode ──
+    parser.add_argument("--draft", action="store_true",
+                        help="Draft/preview mode: scale to 360p for fast extraction")
+    parser.add_argument("--no-normalize", action="store_true",
+                        help="Skip auto-normalization of input codec/pix_fmt (step 0)")
+
+    # ── Phase 2: Queue management ──
+    parser.add_argument("--queue-add", action="store_true",
+                        help="Add current --input/--output as a queue item and exit")
+    parser.add_argument("--queue-run", action="store_true",
+                        help="Process all pending queue items sequentially and exit")
+    parser.add_argument("--queue-list", action="store_true",
+                        help="Print the current queue as a table and exit")
+    parser.add_argument("--queue-retry", metavar="ID",
+                        help="Retry a failed/skipped queue item by ID and exit")
+    parser.add_argument("--queue-remove", metavar="ID",
+                        help="Remove a pending queue item by ID and exit")
+
     return parser
 
 
@@ -530,6 +567,10 @@ def apply_cli_overrides(cfg: dict, args) -> dict:
         cfg["output"]["report_json"] = False
     if args.no_probe:
         cfg["batch"]["probe_before_run"] = False
+    if hasattr(args, "no_normalize") and args.no_normalize:
+        cfg["normalize"]["enabled"] = False
+    if hasattr(args, "draft") and args.draft:
+        cfg["extraction"]["draft"] = True
     return cfg
 
 
@@ -550,6 +591,40 @@ def main():
     if args.hw_report:
         from hw_detect import print_hw_report
         print_hw_report()
+        sys.exit(0)
+
+    # ── Phase 2: Queue standalone utilities (before cfg load, no ffmpeg needed) ──
+    _qm = QueueManager()
+
+    if args.queue_list:
+        items = _qm.list_items()
+        print_queue_table(items)
+        summary = _qm.summary()
+        print(f"  Total: {summary['total']} | Pending: {summary['pending']} | "
+              f"Running: {summary['running']} | Done: {summary['done']} | "
+              f"Failed: {summary['failed']} | Skipped: {summary['skipped']}")
+        sys.exit(0)
+
+    if args.queue_retry:
+        try:
+            _qm.retry(args.queue_retry)
+            print(f"[QUEUE] Item {args.queue_retry} reset to pending.")
+        except (KeyError, ValueError) as exc:
+            print(f"[ERROR] {exc}")
+            sys.exit(1)
+        sys.exit(0)
+
+    if args.queue_remove:
+        try:
+            removed = _qm.remove(args.queue_remove)
+            if removed:
+                print(f"[QUEUE] Item {args.queue_remove} removed.")
+            else:
+                print(f"[QUEUE] Item {args.queue_remove} not found.")
+                sys.exit(1)
+        except ValueError as exc:
+            print(f"[ERROR] {exc}")
+            sys.exit(1)
         sys.exit(0)
 
     cfg = apply_defaults(load_config("config.json"))
@@ -602,7 +677,30 @@ def main():
                 shutil.rmtree(sub)
                 print(f"[CLEAN] Removed empty folder: {sub.name}")
                 removed_count += 1
-        print(f"[CLEAN] Done — removed {removed_count} empty folder(s).")
+        print(f"[CLEAN] Done -- removed {removed_count} empty folder(s).")
+        sys.exit(0)
+
+    # ── Phase 2: Queue add ──
+    if args.queue_add:
+        if not (args.input or args.url or args.batch):
+            parser.error("--queue-add requires --input, --url, or --batch")
+        if not args.output:
+            parser.error("--queue-add requires --output")
+        src = args.input or args.url or args.batch
+        item_id = _qm.add(src, args.output)
+        print(f"[QUEUE] Added item {item_id}: {src} -> {args.output}")
+        sys.exit(0)
+
+    # ── Phase 2: Queue run (process all pending) ──
+    if args.queue_run:
+        pending = _qm.pending_count()
+        if pending == 0:
+            print("[QUEUE] No pending items in queue.")
+            sys.exit(0)
+        print(f"[QUEUE] Running {pending} pending item(s)...")
+        while _qm.pending_count() > 0:
+            _qm.run_next(cfg, process_video)
+        print("[QUEUE] All pending items processed.")
         sys.exit(0)
 
     if input_source_count != 1:
@@ -625,6 +723,10 @@ def main():
     print(f"  Dedup method : {cfg['filter']['dedup_method'].upper()}")
     if cfg["scorer"]["enabled"]:
         print(f"  Scorer       : ON  --  top {cfg['scorer']['top_n']} frames")
+    if cfg["extraction"].get("draft"):
+        print(f"  Draft mode   : ON  (360p fast preview)")
+    if not cfg.get("normalize", {}).get("enabled", True):
+        print(f"  Normalize    : OFF (--no-normalize)")
     print(sep)
 
     # ── Determine video path ──

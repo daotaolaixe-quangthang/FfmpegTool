@@ -10,11 +10,17 @@ Hardware acceleration:
   Pass cfg["_hwaccel_args"] (set by hw_detect.resolve_encoder) to enable
   hardware-accelerated decode. Example: ["-hwaccel", "cuda"] for NVENC.
   Falls back to CPU silently if not set.
+
+Phase 2 additions:
+  Draft mode: cfg["draft"] = True injects scale=640:360 before fps filter.
+  Error parser: ffmpeg failures raise RuntimeError with human-readable message.
 """
 
 import os
 import subprocess
 from pathlib import Path
+
+from error_parser import parse_ffmpeg_error, format_error
 
 
 def extract_by_fps(
@@ -23,22 +29,32 @@ def extract_by_fps(
     fps: float,
     jpeg_quality: int,
     hwaccel_args: list[str] | None = None,
+    draft: bool = False,
 ) -> list[str]:
     """Extract frames at a fixed FPS rate using FFmpeg.
 
     Args:
         hwaccel_args: Optional list of hardware decode args, e.g. ["-hwaccel", "cuda"].
                       Injected before -i. Defaults to [] (CPU decode).
+        draft:        If True, scale to 640x360 before extraction (fast preview mode).
+                      Preserves aspect ratio via scale=640:-2 capped to 360p height.
     """
     os.makedirs(raw_dir, exist_ok=True)
     output_pattern = os.path.join(raw_dir, "frame_%05d.jpg")
     hw_args = hwaccel_args or []
 
+    # Draft mode: scale down to 360p for fast previews
+    # scale=-2:360 keeps aspect ratio; fps filter applied after scale
+    if draft:
+        vf_filter = f"scale=-2:360,fps={fps}"
+    else:
+        vf_filter = f"fps={fps}"
+
     cmd = [
         "ffmpeg", "-y",           # -y (overwrite) MUST be a global option before -i
         *hw_args,                  # hardware decode acceleration (empty = CPU)
         "-i", video_path,
-        "-vf", f"fps={fps}",
+        "-vf", vf_filter,
         "-q:v", str(jpeg_quality),
         "-loglevel", "warning",
         output_pattern,
@@ -46,7 +62,8 @@ def extract_by_fps(
 
     result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg failed:\n{result.stderr}")
+        parsed = parse_ffmpeg_error(result.stderr)
+        raise RuntimeError(format_error(parsed))
 
     frames = sorted(Path(raw_dir).glob("frame_*.jpg"))
     return [str(f) for f in frames]
@@ -106,6 +123,10 @@ def extract_by_scene(
         result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
         if result.returncode == 0 and os.path.exists(output_path):
             frame_paths.append(output_path)
+        elif result.returncode != 0:
+            # Log but don't abort the whole scene loop for single-frame failures
+            parsed = parse_ffmpeg_error(result.stderr)
+            print(f"  [SCENE] Frame {i} failed: {parsed.message}")
 
     return frame_paths
 
@@ -120,6 +141,7 @@ def extract_frames(video_path: str, raw_dir: str, cfg: dict) -> list[str]:
         cfg        : extraction config dict
                      cfg["_hwaccel_args"] (optional): hardware decode args
                      injected by hw_detect and resolve_encoder in main.py.
+                     cfg["draft"] (optional bool): enable 360p draft mode.
 
     Returns:
         list of extracted frame file paths
@@ -129,14 +151,16 @@ def extract_frames(video_path: str, raw_dir: str, cfg: dict) -> list[str]:
     quality         = cfg.get("jpeg_quality", 2)
     scene_threshold = cfg.get("scene_threshold", 27.0)
     hwaccel_args    = cfg.get("_hwaccel_args", [])  # set by hw_detect in main.py
+    draft           = cfg.get("draft", False)        # Phase 2: draft/preview mode
 
-    hw_label = f" [HW:{' '.join(hwaccel_args)}]" if hwaccel_args else ""
-    print(f"\n[EXTRACT] Mode: {mode.upper()}{hw_label} | Video: {os.path.basename(video_path)}")
+    hw_label    = f" [HW:{' '.join(hwaccel_args)}]" if hwaccel_args else ""
+    draft_label = " [DRAFT 360p]" if draft else ""
+    print(f"\n[EXTRACT] Mode: {mode.upper()}{hw_label}{draft_label} | Video: {os.path.basename(video_path)}")
 
     if mode == "scene":
         frames = extract_by_scene(video_path, raw_dir, scene_threshold, quality, hwaccel_args)
     else:
-        frames = extract_by_fps(video_path, raw_dir, fps, quality, hwaccel_args)
+        frames = extract_by_fps(video_path, raw_dir, fps, quality, hwaccel_args, draft=draft)
 
     print(f"[EXTRACT] Done -- {len(frames)} raw frames extracted")
     return frames
