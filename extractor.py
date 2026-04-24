@@ -131,9 +131,13 @@ def extract_by_scene(
             *hw_args,              # hardware decode acceleration
             "-ss", f"{mid_sec:.3f}",
             "-i", video_path,
+        ]
+        if "qsv" in hw_args:
+            cmd += ["-vf", "hwdownload,format=nv12"]
+        cmd += [
             "-vframes", "1",
             "-q:v", str(jpeg_quality),
-            "-loglevel", "quiet",
+            "-loglevel", "error",
             output_path,
         ]
         try:

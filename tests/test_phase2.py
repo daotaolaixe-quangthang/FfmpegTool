@@ -16,6 +16,7 @@ Run from repo root:
 import os
 import sys
 import json
+import types
 import tempfile
 import threading
 import unittest
@@ -410,6 +411,51 @@ class TestDraftMode(unittest.TestCase):
         vf_idx = cmd.index("-vf")
         vf_value = cmd[vf_idx + 1]
         self.assertIn("scale=-2:360", vf_value)
+
+    @patch("extractor.subprocess.run")
+    @patch("extractor.os.path.exists", return_value=True)
+    def test_scene_qsv_extract_inserts_hwdownload_and_preserves_stderr(
+        self, _mock_exists, mock_run
+    ):
+        """Scene extraction with QSV must download frames before JPEG encode and keep error stderr."""
+        from extractor import extract_by_scene
+
+        mock_video = MagicMock()
+
+        start = MagicMock()
+        end = MagicMock()
+        start.get_seconds.return_value = 0.0
+        end.get_seconds.return_value = 2.0
+
+        mock_scene_manager = MagicMock()
+        mock_scene_manager.get_scene_list.return_value = [(start, end)]
+
+        fake_detector = MagicMock()
+        fake_scenedetect = types.ModuleType("scenedetect")
+        fake_detectors = types.ModuleType("scenedetect.detectors")
+        fake_scenedetect.open_video = MagicMock(return_value=mock_video)
+        fake_scenedetect.SceneManager = MagicMock(return_value=mock_scene_manager)
+        fake_detectors.AdaptiveDetector = MagicMock(return_value=fake_detector)
+
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        with patch.dict(sys.modules, {
+            "scenedetect": fake_scenedetect,
+            "scenedetect.detectors": fake_detectors,
+        }):
+            with tempfile.TemporaryDirectory() as d:
+                frames = extract_by_scene(
+                    "/v/clip.mp4", d, threshold=27.0, jpeg_quality=2,
+                    hwaccel_args=["-hwaccel", "qsv"],
+                )
+
+        self.assertEqual(len(frames), 1)
+        cmd = mock_run.call_args[0][0]
+        vf_idx = cmd.index("-vf")
+        vf_value = cmd[vf_idx + 1]
+        self.assertEqual(vf_value, "hwdownload,format=nv12")
+        loglevel_idx = cmd.index("-loglevel")
+        self.assertEqual(cmd[loglevel_idx + 1], "error")
 
     def test_build_command_includes_draft_flag(self):
         """build_command with draft=True must include --draft in command."""
