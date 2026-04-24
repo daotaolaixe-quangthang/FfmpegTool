@@ -1,7 +1,7 @@
 """
 main.py
 =======
-FfmpegTool — Video Frame Extractor & Smart Filter
+FfmpegTool -- Video Frame Extractor & Smart Filter
 ==================================================
 
 Full pipeline:
@@ -19,6 +19,11 @@ Phase 1 additions:
   Hardware acceleration auto-detected from config hardware.encoder
   Output naming pattern: config output.naming_pattern
 
+Phase 4 additions:
+  --workers N       Parallel workers for batch mode (default 1 = sequential)
+  --dag FILE        Run one source -> multiple preset branches (DAG spec JSON)
+  --dag-workers N   Parallel workers for DAG branches (default 1 = sequential)
+
 Usage:
   # Single video (local file)
   python main.py --input "G:/Videos/clip.mp4" --output "G:/Frames"
@@ -29,23 +34,14 @@ Usage:
   # List available presets
   python main.py --list-presets
 
+  # Parallel batch (2 workers)
+  python main.py --batch "G:/Videos/" --output "G:/Frames" --workers 2
+
+  # DAG: 1 source -> multiple presets
+  python main.py --dag dag_spec.json --output G:/Frames
+
   # From TikTok / YouTube URL
   python main.py --url "https://www.tiktok.com/..." --output "G:/Frames"
-
-  # Scene-aware extraction (smarter than fps)
-  python main.py --input "G:/Videos/clip.mp4" --output "G:/Frames" --mode scene
-
-  # Custom thresholds
-  python main.py --input clip.mp4 --output G:/Frames --fps 3 --blur 60 --sim 0.65
-
-  # Use SSIM for duplicate detection (more accurate, slower)
-  python main.py --input clip.mp4 --output G:/Frames --method ssim
-
-  # Keep only top 20 aesthetically best frames
-  python main.py --input clip.mp4 --output G:/Frames --top 20
-
-  # Batch: process all videos in a folder
-  python main.py --batch "G:/Videos/" --output "G:/Frames"
 """
 
 import os
@@ -211,6 +207,13 @@ def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int 
     print(f"  Processing: {video_name}")
     print(sep)
 
+    # BUG-C2 FIX: cache key must always use the ORIGINAL video path (before
+    # normalization), because the normalized temp file is deleted after the
+    # pipeline by norm_result.cleanup(). If we keyed on the temp path, every
+    # subsequent run would get an OSError on getmtime → mtime="0" → perpetual
+    # cache miss.
+    original_video_path = video_path
+
     # ── Step 0 (Phase 2): Auto-normalize input codec/pix_fmt ──
     norm_result = None
     if cfg.get("normalize", {}).get("enabled", True):
@@ -222,10 +225,13 @@ def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int 
             if norm_result.was_transcoded:
                 video_path = norm_result.path  # use normalized file for extraction
 
+    # BUG-H4 FIX: create a single CacheManager instance reused for both lookup
+    # and store (was two separate CacheManager() calls before).
+    _cache_mgr = CacheManager() if not cfg.get("no_cache", False) else None
+
     # ── Step 0.5 (Phase 3): Cache hit check ──
-    if not cfg.get("no_cache", False):
-        _cache_mgr = CacheManager()
-        cached_frames = _cache_mgr.get_cached_frames(video_path, cfg)
+    if _cache_mgr is not None:
+        cached_frames = _cache_mgr.get_cached_frames(original_video_path, cfg)
         if cached_frames:
             print(f"[CACHE] Cache hit -- skipping extraction for {video_name}")
             # Build minimal stats from cached frames and write reports
@@ -314,10 +320,9 @@ def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int 
             norm_result.cleanup()
 
     # ── Step 0.5b (Phase 3): Store frames in cache after successful extraction ──
-    if not cfg.get("no_cache", False) and stats.get("final_paths"):
+    if _cache_mgr is not None and stats.get("final_paths"):
         try:
-            _cache_mgr = CacheManager()
-            _cache_mgr.store_frames(video_path, cfg, stats["final_paths"])
+            _cache_mgr.store_frames(original_video_path, cfg, stats["final_paths"])
         except Exception as _cache_exc:
             print(f"[CACHE] Warning: failed to cache frames: {_cache_exc}")
 
@@ -585,6 +590,16 @@ Examples:
     parser.add_argument("--clear-cache", action="store_true",
                         help="Purge all cached frames and exit")
 
+    # ── Phase 4: Parallel batch ──
+    parser.add_argument("--workers", type=int, default=1, metavar="N",
+                        help="Parallel workers for batch mode (default 1 = sequential)")
+
+    # ── Phase 4: DAG runner ──
+    parser.add_argument("--dag", metavar="FILE",
+                        help="DAG spec JSON file: 1 source -> multiple preset branches")
+    parser.add_argument("--dag-workers", type=int, default=1, metavar="N",
+                        help="Parallel workers for DAG branches (default 1 = sequential)")
+
     return parser
 
 
@@ -767,8 +782,10 @@ def main():
             print("[QUEUE] No pending items in queue.")
             sys.exit(0)
         print(f"[QUEUE] Running {pending} pending item(s)...")
+        batch_index = 0
         while _qm.pending_count() > 0:
-            _qm.run_next(cfg, process_video)
+            batch_index += 1
+            _qm.run_next(cfg, process_video, batch_index=batch_index)
         print("[QUEUE] All pending items processed.")
         sys.exit(0)
 
@@ -814,6 +831,28 @@ def main():
     print(sep)
 
     # ── Determine video path ──
+    # ── Phase 4: DAG mode ──
+    if args.dag:
+        from dag_runner import load_dag_spec, run_dag
+        try:
+            spec = load_dag_spec(args.dag)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"[ERROR] DAG spec error: {exc}")
+            sys.exit(1)
+        # CLI --output overrides spec-level output (spec branch output still wins per-branch)
+        if args.output and not spec.get("output"):
+            spec["output"] = args.output
+        dag_workers = getattr(args, "dag_workers", 1)
+        result = run_dag(spec, cfg, default_output=args.output or "",
+                         workers=dag_workers)
+        success = result["success"]
+        failed  = result["failed"]
+        skipped = result["skipped"]
+        total   = success + failed + skipped
+        print(f"\n[DAG] Finished {total} branch(es): {success} OK, "
+              f"{skipped} skipped, {failed} failed")
+        sys.exit(0 if failed == 0 else 1)
+
     if args.url:
         os.makedirs(args.output, exist_ok=True)
         try:
@@ -827,7 +866,21 @@ def main():
         if not os.path.isdir(args.batch):
             print(f"[ERROR] Batch folder not found: {args.batch}")
             sys.exit(1)
-        process_batch(args.batch, args.output, cfg)
+        # ── Phase 4: Parallel batch ──
+        n_workers = getattr(args, "workers", 1)
+        if n_workers > 1:
+            from parallel_runner import run_parallel_batch, resolve_max_workers
+            from pathlib import Path as _Path
+            _video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+            video_files = sorted([
+                str(f) for f in _Path(args.batch).iterdir()
+                if f.is_file() and f.suffix.lower() in _video_exts
+            ])
+            eff_workers = resolve_max_workers(n_workers)
+            print(f"[BATCH] Parallel mode: {eff_workers} workers")
+            run_parallel_batch(video_files, args.output, cfg, workers=n_workers)
+        else:
+            process_batch(args.batch, args.output, cfg)
 
     else:
         input_path = args.input
@@ -840,7 +893,20 @@ def main():
         if os.path.isdir(input_path):
             print(f"[INFO] --input is a directory. Switching to batch mode automatically.")
             print(f"[INFO] Scanning folder: {input_path}")
-            process_batch(input_path, args.output, cfg)
+            n_workers = getattr(args, "workers", 1)
+            if n_workers > 1:
+                from parallel_runner import run_parallel_batch, resolve_max_workers
+                from pathlib import Path as _Path
+                _video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+                video_files = sorted([
+                    str(f) for f in _Path(input_path).iterdir()
+                    if f.is_file() and f.suffix.lower() in _video_exts
+                ])
+                eff_workers = resolve_max_workers(n_workers)
+                print(f"[BATCH] Parallel mode: {eff_workers} workers")
+                run_parallel_batch(video_files, args.output, cfg, workers=n_workers)
+            else:
+                process_batch(input_path, args.output, cfg)
 
         elif os.path.isfile(input_path):
             process_video(input_path, args.output, cfg)

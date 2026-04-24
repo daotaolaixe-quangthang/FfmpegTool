@@ -39,6 +39,12 @@ app = Flask(__name__, template_folder=os.path.join(TOOL_DIR, "templates"))
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()  # Protect all mutations of JOBS dict
 
+# BUG-H3 FIX: store completed job stats separately so that SSE streams in
+# flight don't lose their results when the JOBS dict evicts old entries.
+# Keyed by job_id; only grows when a job completes. Capped at 100 entries.
+COMPLETED_STATS: dict[str, dict | None] = {}
+COMPLETED_STATS_LOCK = threading.Lock()
+
 # ── Persistent batch queue (Phase 2) ──
 QUEUE_MGR = QueueManager()
 
@@ -445,6 +451,16 @@ def api_run():
                 job["stats"] = stats
                 job["status"] = "done" if exit_code == 0 else "error"
 
+        # BUG-H3 FIX: persist stats in COMPLETED_STATS before signalling "done"
+        # so the SSE reader can retrieve them even if the job gets evicted from
+        # JOBS between the "done" signal and the SSE handler reading stats.
+        with COMPLETED_STATS_LOCK:
+            COMPLETED_STATS[job_id] = stats
+            # Evict oldest completed entries if dict grows beyond 100
+            if len(COMPLETED_STATS) > 100:
+                oldest = next(iter(COMPLETED_STATS))
+                del COMPLETED_STATS[oldest]
+
         q.put(("done", str(exit_code)))
 
     thread = threading.Thread(target=run_pipeline, daemon=True)
@@ -472,11 +488,15 @@ def api_stream(job_id: str):
                     safe = msg.replace("\n", " ").replace("\r", "")
                     yield f"data: {json.dumps({'type': 'log', 'text': safe})}\n\n"
                 elif msg_type == "done":
-                    # BUG-3 FIX: use .get() instead of direct index to avoid
-                    # KeyError if the job was evicted from JOBS during streaming.
-                    with JOBS_LOCK:
-                        finished_job = JOBS.get(job_id, {})
-                    stats = finished_job.get("stats")
+                    # BUG-H3 FIX: read stats from COMPLETED_STATS (never evicted
+                    # while streaming) rather than JOBS (may have been evicted if
+                    # >20 concurrent jobs exist). Fall back to JOBS for safety.
+                    with COMPLETED_STATS_LOCK:
+                        stats = COMPLETED_STATS.get(job_id)
+                    if stats is None:
+                        with JOBS_LOCK:
+                            finished_job = JOBS.get(job_id, {})
+                        stats = finished_job.get("stats")
                     yield f"data: {json.dumps({'type': 'done', 'exit_code': msg, 'stats': stats})}\n\n"
                     break
             except queue.Empty:
@@ -705,18 +725,20 @@ def api_queue_run():
     if pending == 0:
         return jsonify({"started": False, "message": "No pending items", "pending": 0})
 
+    # BUG-M2 FIX: imports were inside the thread function — moved here so they
+    # are resolved at call time (not inside the daemon thread on every invocation).
+    from main import apply_defaults, load_config, process_video
+    from hw_detect import resolve_encoder, get_ffmpeg_hwaccel_args
+
     def _run_queue():
-        import sys
-        import os
-        sys.path.insert(0, TOOL_DIR)
-        from main import apply_defaults, load_config
-        from hw_detect import resolve_encoder, get_ffmpeg_hwaccel_args
-        from main import process_video
         cfg = apply_defaults(load_config("config.json"))
         hw_key = resolve_encoder(cfg["hardware"])
         cfg["extraction"]["_hwaccel_args"] = get_ffmpeg_hwaccel_args(hw_key)
+        # BUG-H1 FIX: pass incrementing batch_index so {index} naming token works
+        batch_index = 0
         while QUEUE_MGR.pending_count() > 0:
-            QUEUE_MGR.run_next(cfg, process_video)
+            batch_index += 1
+            QUEUE_MGR.run_next(cfg, process_video, batch_index=batch_index)
 
     t = threading.Thread(target=_run_queue, daemon=True)
     t.start()
@@ -882,6 +904,166 @@ def api_watch_status():
                "started_at": str|null, "watchdog_available": bool}
     """
     return jsonify(WATCH_DAEMON.status())
+
+
+# ──────────────────────────────────────────────
+# Phase 4: Batch parallel API route
+# ──────────────────────────────────────────────
+
+@app.route("/api/batch/run", methods=["POST"])
+def api_batch_run():
+    """
+    Trigger parallel batch processing.
+
+    Body JSON:
+        {
+            "input":    "/path/to/folder",
+            "output":   "/path/to/output",
+            "parallel": true,          (optional, bool)
+            "workers":  2,             (optional, int, default 1)
+            "preset":   "tiktok_pack"  (optional)
+        }
+
+    Response: {"started": true, "workers": N, "video_count": N}
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data"}), 400
+
+    input_folder = (data.get("input") or "").strip()
+    output_dir   = (data.get("output") or "").strip()
+
+    if not input_folder:
+        return jsonify({"error": "input is required"}), 400
+    if not output_dir:
+        return jsonify({"error": "output is required"}), 400
+    if not os.path.isdir(input_folder):
+        return jsonify({"error": f"input folder not found: {input_folder}"}), 400
+
+    workers     = int(data.get("workers", 1))
+    do_parallel = bool(data.get("parallel", workers > 1))
+
+    # Collect video files
+    video_exts  = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+    video_files = sorted([
+        str(f) for f in Path(input_folder).iterdir()
+        if f.is_file() and f.suffix.lower() in video_exts
+    ])
+
+    if not video_files:
+        return jsonify({"started": False, "message": "No video files found", "video_count": 0})
+
+    from main import apply_defaults, load_config
+    from hw_detect import resolve_encoder, get_ffmpeg_hwaccel_args
+    from parallel_runner import run_parallel_batch
+
+    def _run():
+        cfg = apply_defaults(load_config("config.json"))
+        # Apply preset if requested
+        preset = (data.get("preset") or "").strip()
+        if preset:
+            from preset_loader import apply_preset
+            cfg = apply_preset(cfg, preset)
+        hw_key = resolve_encoder(cfg["hardware"])
+        cfg["extraction"]["_hwaccel_args"] = get_ffmpeg_hwaccel_args(hw_key)
+        n = workers if do_parallel else 1
+        run_parallel_batch(video_files, output_dir, cfg, workers=n)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    from parallel_runner import resolve_max_workers
+    eff = resolve_max_workers(workers) if do_parallel else 1
+    return jsonify({
+        "started":     True,
+        "parallel":    do_parallel,
+        "workers":     eff,
+        "video_count": len(video_files),
+    })
+
+
+# ──────────────────────────────────────────────
+# Phase 4: DAG API route
+# ──────────────────────────────────────────────
+
+@app.route("/api/dag/run", methods=["POST"])
+def api_dag_run():
+    """
+    Execute a DAG job graph: 1 source -> multiple preset branches.
+
+    Body JSON (inline spec):
+        {
+            "source": "/path/to/clip.mp4",
+            "output": "/path/to/output",
+            "branches": [
+                {"preset": "tiktok_pack"},
+                {"preset": "youtube_shorts"}
+            ],
+            "workers": 1   (optional, default 1 = sequential)
+        }
+
+    OR load from a spec file:
+        {"spec_file": "/path/to/dag_spec.json", "workers": 2}
+
+    Response:
+        {
+            "source": str,
+            "branches": [{preset, output, status, error},...],
+            "success": N, "skipped": N, "failed": N
+        }
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data"}), 400
+
+    from dag_runner import load_dag_spec, validate_dag_spec, run_dag
+    from main import apply_defaults, load_config
+
+    workers = int(data.get("workers", 1))
+
+    try:
+        if "spec_file" in data:
+            spec = load_dag_spec(data["spec_file"])
+        else:
+            spec = validate_dag_spec(data)
+    except (FileNotFoundError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
+        cfg = apply_defaults(load_config("config.json"))
+        result = run_dag(spec, cfg, default_output=spec.get("output") or "", workers=workers)
+        return jsonify(result)
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+# ──────────────────────────────────────────────
+# Phase 4: System status (memory + workers)
+# ──────────────────────────────────────────────
+
+@app.route("/api/system/status", methods=["GET"])
+def api_system_status():
+    """
+    Return system resource status for the UI.
+
+    Response:
+        {
+            "cpu_count": N,
+            "max_safe_workers": N,
+            "free_ram_mb": N | null,
+            "psutil_available": bool
+        }
+    """
+    from parallel_runner import get_free_ram_mb, resolve_max_workers, _PSUTIL_AVAILABLE
+    cpu = os.cpu_count() or 2
+    return jsonify({
+        "cpu_count":        cpu,
+        "max_safe_workers": resolve_max_workers(4),
+        "free_ram_mb":      get_free_ram_mb(),
+        "psutil_available": _PSUTIL_AVAILABLE,
+    })
 
 
 # ─────────────────────────────────────────────
