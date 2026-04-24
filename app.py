@@ -25,6 +25,8 @@ from pathlib import Path
 from flask import Flask, render_template, request, jsonify, Response, send_from_directory
 from preset_loader import list_presets
 from queue_manager import QueueManager
+from cache_manager import CacheManager
+from watch_daemon import get_daemon, _WATCHDOG_AVAILABLE
 
 # ── Ensure FfmpegTool dir is in path ──
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +41,12 @@ JOBS_LOCK = threading.Lock()  # Protect all mutations of JOBS dict
 
 # ── Persistent batch queue (Phase 2) ──
 QUEUE_MGR = QueueManager()
+
+# ── Phase 3: Cache manager ──
+CACHE_MGR = CacheManager()
+
+# ── Phase 3: Watch daemon (shared singleton) ──
+WATCH_DAEMON = get_daemon(queue_mgr=QUEUE_MGR)
 
 
 # ─────────────────────────────────────────────
@@ -715,6 +723,167 @@ def api_queue_run():
     return jsonify({"started": True, "pending": pending})
 
 
+# ──────────────────────────────────────────────
+# Phase 3: Template API routes
+# ──────────────────────────────────────────────
+
+@app.route("/api/template/validate", methods=["POST"])
+def api_template_validate():
+    """
+    Dry-run validation of a template (no jobs are queued).
+
+    Body JSON:
+        {"jobs": [{...}, ...]}  OR  {"csv": "CSV text as string"}
+
+    Response:
+        {"queued": N, "skipped": N, "errors": [...]}
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data"}), 400
+
+    try:
+        rows = _parse_template_body(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    known = [p["file"] for p in list_presets()]
+    from template_runner import run_template
+    result = run_template(rows, QUEUE_MGR, known_presets=known, dry_run=True)
+    return jsonify(result)
+
+
+@app.route("/api/template/run", methods=["POST"])
+def api_template_run():
+    """
+    Validate and enqueue all rows from a template body.
+
+    Body JSON:
+        {"jobs": [{...}, ...], "output": "optional_base_output"}
+        OR  {"csv": "CSV text", "output": "..."}
+
+    Response:
+        {"queued": N, "skipped": N, "errors": [...], "item_ids": [...]}
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data"}), 400
+
+    try:
+        rows = _parse_template_body(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    known      = [p["file"] for p in list_presets()]
+    base_output = (data.get("output") or "").strip() or None
+    from template_runner import run_template
+    result = run_template(rows, QUEUE_MGR, base_output=base_output, known_presets=known)
+    return jsonify(result)
+
+
+def _parse_template_body(data: dict) -> list[dict]:
+    """Extract row list from request body (jobs list OR csv string)."""
+    if "jobs" in data:
+        jobs = data["jobs"]
+        if not isinstance(jobs, list):
+            raise ValueError("'jobs' must be a JSON array")
+        return [{k.lower().strip(): v for k, v in job.items()} for job in jobs]
+    if "csv" in data:
+        import io
+        import csv as _csv
+        text = data["csv"]
+        if not isinstance(text, str):
+            raise ValueError("'csv' must be a string")
+        reader = _csv.DictReader(io.StringIO(text))
+        return [{k.lower().strip(): (v or "").strip() for k, v in row.items()}
+                for row in reader]
+    raise ValueError("Body must contain 'jobs' (array) or 'csv' (string)")
+
+
+# ──────────────────────────────────────────────
+# Phase 3: Cache API routes
+# ──────────────────────────────────────────────
+
+@app.route("/api/cache/stats", methods=["GET"])
+def api_cache_stats():
+    """
+    Return cache statistics.
+
+    Response: {"entries": N, "total_files": N, "total_bytes": N, "cache_dir": str}
+    """
+    try:
+        return jsonify(CACHE_MGR.stats())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/cache/clear", methods=["DELETE"])
+def api_cache_clear():
+    """
+    Purge all cached frames.
+
+    Response: {"purged": N}
+    """
+    try:
+        purged = CACHE_MGR.purge_all()
+        return jsonify({"purged": purged})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+# ──────────────────────────────────────────────
+# Phase 3: Watch daemon API routes
+# ──────────────────────────────────────────────
+
+@app.route("/api/watch/start", methods=["POST"])
+def api_watch_start():
+    """
+    Start the watch daemon on a folder.
+
+    Body JSON: {"folder": str, "output": str, "preset": str (optional)}
+    Response:  {"watching": true, "folder": str, ...}
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data"}), 400
+    folder = (data.get("folder") or "").strip()
+    output = (data.get("output") or "").strip()
+    preset = (data.get("preset") or "").strip()
+    if not folder:
+        return jsonify({"error": "folder is required"}), 400
+    if not output:
+        return jsonify({"error": "output is required"}), 400
+    try:
+        state = WATCH_DAEMON.start(folder, output, preset)
+        return jsonify(state)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+
+
+@app.route("/api/watch/stop", methods=["POST"])
+def api_watch_stop():
+    """
+    Stop the watch daemon.
+
+    Response: {"watching": false, ...}
+    """
+    state = WATCH_DAEMON.stop()
+    return jsonify(state)
+
+
+@app.route("/api/watch/status", methods=["GET"])
+def api_watch_status():
+    """
+    Return current watch daemon status.
+
+    Response: {"watching": bool, "folder": str, "output": str, "preset": str,
+               "started_at": str|null, "watchdog_available": bool}
+    """
+    return jsonify(WATCH_DAEMON.status())
+
+
 # ─────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────
@@ -725,6 +894,8 @@ if __name__ == "__main__":
     print(f"\n  FfmpegTool Web UI")
     print(f"  Open: {url}")
     print(f"  Press Ctrl+C to stop\n")
+    # Phase 3: auto-resume watch daemon from persisted state
+    WATCH_DAEMON.resume_from_state()
     # Open browser after a short delay
     threading.Timer(1.2, lambda: webbrowser.open(url)).start()
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

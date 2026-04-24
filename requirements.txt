@@ -7,3 +7,4 @@ scenedetect[opencv]>=0.6.3
 yt-dlp>=2024.1.0
 scikit-image>=0.21.0
 flask>=3.0.0
+watchdog>=3.0.0

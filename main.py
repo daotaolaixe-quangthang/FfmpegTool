@@ -67,6 +67,7 @@ from hw_detect import resolve_encoder, get_ffmpeg_hwaccel_args
 from probe_first import scan_batch
 from queue_manager import QueueManager, QueueItem, print_queue_table
 from normalizer import normalize_video
+from cache_manager import CacheManager
 
 
 # ─────────────────────────────────────────────
@@ -188,6 +189,8 @@ def resolve_video_output_name(
 def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int = 0) -> dict:
     """
     Full pipeline for a single video:
+      0. [Optional] Auto-normalize input codec/pix_fmt
+      0.5. [Optional] Cache hit check -- skip extraction if frames already cached
       1. Extract frames (raw)
       2. Filter blurry frames
       3. Filter duplicate frames (pHash or SSIM)
@@ -218,6 +221,45 @@ def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int 
             norm_result = normalize_video(video_path, video_output_dir, cfg, probe=probe)
             if norm_result.was_transcoded:
                 video_path = norm_result.path  # use normalized file for extraction
+
+    # ── Step 0.5 (Phase 3): Cache hit check ──
+    if not cfg.get("no_cache", False):
+        _cache_mgr = CacheManager()
+        cached_frames = _cache_mgr.get_cached_frames(video_path, cfg)
+        if cached_frames:
+            print(f"[CACHE] Cache hit -- skipping extraction for {video_name}")
+            # Build minimal stats from cached frames and write reports
+            os.makedirs(video_output_dir, exist_ok=True)
+            stats = {
+                "total_raw":          len(cached_frames),
+                "removed_blur":       0,
+                "removed_duplicate":  0,
+                "final_count":        len(cached_frames),
+                "final_paths":        cached_frames,
+                "output_dir":         unique_dir,
+                "blur_threshold":     cfg["filter"].get("blur_threshold"),
+                "similarity_threshold": cfg["filter"].get("similarity_threshold"),
+                "dedup_method":       cfg["filter"].get("dedup_method", "phash"),
+                "scorer_enabled":     False,
+                "top_n_requested":    None,
+                "top_n_selected":     None,
+                "top_frames_dir":     None,
+                "score_report_path": None,
+                "cache_hit":          True,
+            }
+            if cfg["output"].get("report_json", True):
+                rpath = save_json_report(stats, video_output_dir, video_name)
+                print(f"[REPORT] JSON: {rpath}")
+            if cfg["output"].get("generate_html_preview", True) and stats["final_paths"]:
+                cols = cfg["output"].get("preview_columns", 5)
+                hpath = save_html_preview(
+                    stats["final_paths"], video_output_dir, video_name, stats, columns=cols
+                )
+                print(f"[REPORT] HTML: {hpath}")
+            print_summary(stats, video_name)
+            if norm_result and norm_result.was_transcoded:
+                norm_result.cleanup()
+            return stats
 
     # ── Step 1: Extract ──
     raw_frames = extract_frames(video_path, raw_dir, cfg["extraction"])
@@ -270,6 +312,14 @@ def process_video(video_path: str, output_dir: str, cfg: dict, batch_index: int 
         # Phase 2: clean up normalized temp file after pipeline completes
         if norm_result and norm_result.was_transcoded:
             norm_result.cleanup()
+
+    # ── Step 0.5b (Phase 3): Store frames in cache after successful extraction ──
+    if not cfg.get("no_cache", False) and stats.get("final_paths"):
+        try:
+            _cache_mgr = CacheManager()
+            _cache_mgr.store_frames(video_path, cfg, stats["final_paths"])
+        except Exception as _cache_exc:
+            print(f"[CACHE] Warning: failed to cache frames: {_cache_exc}")
 
     # ── Step 6: Reports ──
     if cfg["output"].get("report_json", True):
@@ -525,6 +575,16 @@ Examples:
     parser.add_argument("--queue-remove", metavar="ID",
                         help="Remove a pending queue item by ID and exit")
 
+    # ── Phase 3: Template runner ──
+    parser.add_argument("--template", metavar="FILE",
+                        help="CSV or JSON template file with batch job definitions")
+
+    # ── Phase 3: Cache ──
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Bypass frame cache (always re-extract)")
+    parser.add_argument("--clear-cache", action="store_true",
+                        help="Purge all cached frames and exit")
+
     return parser
 
 
@@ -571,6 +631,8 @@ def apply_cli_overrides(cfg: dict, args) -> dict:
         cfg["normalize"]["enabled"] = False
     if hasattr(args, "draft") and args.draft:
         cfg["extraction"]["draft"] = True
+    if hasattr(args, "no_cache") and args.no_cache:
+        cfg["no_cache"] = True
     return cfg
 
 
@@ -591,6 +653,13 @@ def main():
     if args.hw_report:
         from hw_detect import print_hw_report
         print_hw_report()
+        sys.exit(0)
+
+    # ── Phase 3: Clear cache ──
+    if args.clear_cache:
+        cm = CacheManager()
+        purged = cm.purge_all()
+        print(f"[CACHE] Purged {purged} cache entries.")
         sys.exit(0)
 
     # ── Phase 2: Queue standalone utilities (before cfg load, no ffmpeg needed) ──
@@ -701,6 +770,21 @@ def main():
         while _qm.pending_count() > 0:
             _qm.run_next(cfg, process_video)
         print("[QUEUE] All pending items processed.")
+        sys.exit(0)
+
+    # ── Phase 3: Template runner ──
+    if args.template:
+        from template_runner import load_template, run_template
+        from preset_loader import list_presets as _list_presets
+        known = [p["file"] for p in _list_presets()]
+        rows = load_template(args.template)
+        base_out = args.output or None
+        result = run_template(rows, _qm, base_output=base_out, known_presets=known)
+        print(f"[TEMPLATE] Queued: {result['queued']} | Skipped: {result['skipped']}")
+        for err in result["errors"]:
+            print(f"  [ROW {err['row_index']}] {err['video_src']}: {', '.join(err['errors'])}")
+        if result["queued"] > 0:
+            print(f"[TEMPLATE] Run queue with: python main.py --queue-run")
         sys.exit(0)
 
     if input_source_count != 1:
